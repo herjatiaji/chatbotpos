@@ -17,7 +17,7 @@ async function callLlama(promptText, retries = 3, delay = 2000) {
     const invokeUrl = "https://integrate.api.nvidia.com/v1/chat/completions";
     
     // Nanti pindahkan key ini ke file .env demi keamanan: process.env.NVIDIA_API_KEY
-    const apiKey = "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"; 
+    const apiKey = process.env.NVIDIA_API_KEY;
 
     const payload = {
         "model": "meta/llama-4-maverick-17b-128e-instruct",
