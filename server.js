@@ -185,12 +185,14 @@ Cara menjawab:
     }
 });
 
-const PORT = 3000;
-app.listen(PORT, () => {
+// Ganti baris const PORT = 3000; menjadi:
+const PORT = process.env.PORT || 3000;
+
+app.listen(PORT, '0.0.0.0', () => {
     console.log(`
 =========================================
 🚀 SERVER NVIDIA NEMOTRON AKTIF
-🔗 Akses di: http://localhost:${PORT}
+🔗 Port: ${PORT}
 =========================================
     `);
 });
