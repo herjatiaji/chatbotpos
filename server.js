@@ -3,6 +3,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import 'dotenv/config';
 import sql from './db.js';
+import OpenAI from 'openai';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
@@ -11,62 +12,70 @@ app.use(express.json());
 app.use(express.static('public'));
 
 // ==========================================
-// AI ENGINE: LLaMA 4 Maverick (via NVIDIA API)
+// KONFIGURASI NVIDIA NIM (OpenAI-compatible)
 // ==========================================
-async function callLlama(promptText, retries = 3, delay = 2000) {
-    const invokeUrl = "https://integrate.api.nvidia.com/v1/chat/completions";
-    
-    // Nanti pindahkan key ini ke file .env demi keamanan: process.env.NVIDIA_API_KEY
-    const apiKey = process.env.NVIDIA_API_KEY;
+const openai = new OpenAI({
+    apiKey: process.env.NVIDIA_API_KEY,
+    baseURL: 'https://integrate.api.nvidia.com/v1',
+});
 
-    const payload = {
-        "model": "meta/llama-4-maverick-17b-128e-instruct",
-        "messages": [{"role": "user", "content": promptText}],
-        "max_tokens": 1024,
-        "temperature": 0.1, // Wajib rendah agar output SQL tidak halusinasi
-        "top_p": 1.00,
-        "stream": false
-    };
+// ==========================================
+// AI ENGINE: NVIDIA NEMOTRON
+// enableThinking: false → SQL generation (deterministik & cepat)
+// enableThinking: true  → Summary/jawaban (lebih cerdas & natural)
+// ==========================================
+async function callNemotron(promptText, enableThinking = false, retries = 3, delay = 5000) {
+    if (!process.env.NVIDIA_API_KEY) throw new Error("NVIDIA_API_KEY kosong!");
 
     for (let i = 0; i < retries; i++) {
         try {
-            // Menggunakan native fetch bawaan Node.js demi keamanan & performa
-            const response = await fetch(invokeUrl, {
-                method: 'POST',
-                headers: {
-                    "Authorization": `Bearer ${apiKey}`,
-                    "Content-Type": "application/json",
-                    "Accept": "application/json"
+            // Kita gunakan model Nemotron 3 (Pastikan nama model sesuai di dashboard NVIDIA)
+            const modelName = 'nvidia/nemotron-3-super-120b-a12b';
+            
+            const response = await openai.chat.completions.create({
+                model: modelName,
+                messages: [{ role: 'user', content: promptText }],
+                temperature: enableThinking ? 1 : 0.1,
+                top_p: 0.95,
+                max_tokens: enableThinking ? 4096 : 2048,
+                // Sesuai dokumentasi NVIDIA NIM, ini dikirim via extra_body jika SDK tidak mendukung langsung
+                extra_body: {
+                    reasoning_budget: enableThinking ? 4096 : 0,
                 },
-                body: JSON.stringify(payload)
+                stream: true,
             });
 
-            if (!response.ok) {
-                const errorDetail = await response.text();
-                console.log(`   [⚠️ NVIDIA API Error] Status: ${response.status} - ${errorDetail}`);
-                
-                if (response.status >= 500 || response.status === 429) {
-                    if (i === retries - 1) throw new Error("Server NVIDIA Overload.");
-                    await new Promise(res => setTimeout(res, delay));
-                    delay *= 2;
-                    continue;
-                }
-                throw new Error(`API Error ${response.status}`);
+            let fullContent = '';
+            for await (const chunk of response) {
+                // Log pergerakan chunk di terminal agar kita tahu server tidak mati
+                const content = chunk.choices[0]?.delta?.content || '';
+                fullContent += content;
+                if (enableThinking && content) process.stdout.write("."); // Titik progress
             }
 
-            const data = await response.json();
-            // Ekstrak balasan dari struktur OpenAI-compatible
-            return data.choices[0].message.content.trim();
+            return fullContent.trim();
 
         } catch (error) {
-            if (i === retries - 1) throw error;
-            console.log(`   [⚠️ Koneksi Terputus] Menunggu ${delay/1000} dtk...`);
+            // 🔥 LOG ERROR DETAIL UNTUK DEBUGGING
+            console.error(`\n[🚨 API ERROR - Percobaan ${i+1}]`);
+            console.error(`   - Status: ${error.status || 'Unknown'}`);
+            console.error(`   - Message: ${error.message}`);
+            
+            // Cek apakah error karena limit kuota
+            const isRateLimit = error.status === 429 || error.message.includes('429');
+            const isServerOverload = error.status === 503 || error.message.includes('503');
+
+            if (isRateLimit) console.warn("   [💡 INFO]: Anda terkena Rate Limit. Harap tunggu sebentar.");
+            if (isServerOverload) console.warn("   [💡 INFO]: Server NVIDIA sedang sangat sibuk.");
+
+            if (i === retries - 1) throw new Error(`Gagal menghubungi server AI setelah ${retries} kali percobaan.`);
+
+            console.log(`   [⏳ RETRY] Menunggu ${delay / 1000} dtk sebelum mencoba lagi...`);
             await new Promise(res => setTimeout(res, delay));
-            delay *= 2;
+            delay *= 2; 
         }
     }
 }
-
 // ==========================================
 // API ENDPOINT
 // ==========================================
@@ -75,7 +84,7 @@ app.post('/api/chat', async (req, res) => {
 
     try {
         console.log(`\n💬 Pertanyaan masuk: "${message}"`);
-        
+
         const userCheck = await sql`
             SELECT u.owner_name, u.store_id, s.store_name 
             FROM whatsapp_users u 
@@ -89,25 +98,44 @@ app.post('/api/chat', async (req, res) => {
 
         const activeUser = userCheck[0];
 
+        // 🧠 PROMPT STEP A: PEMBUAT SQL (thinking OFF — deterministik)
         const SYSTEM_PROMPT = `
 Kamu adalah AI Data Analyst operasional Cafe.
-Database PostgreSQL memiliki skema KETAT berikut (HANYA GUNAKAN KOLOM INI):
-1. transactions (id, store_id, receipt_number, order_type, transaction_date, total_amount, payment_method)
-2. transaction_details (id, transaction_id, menu_item_id, qty, subtotal)
-3. menu_items (id, store_id, category_id, name, price)
-4. inventory (id, store_id, item_name, unit, current_stock)
+Database PostgreSQL memiliki skema KETAT berikut (HANYA GUNAKAN KOLOM YANG ADA DI SINI):
 
-ATURAN SQL & PENAMAAN (SANGAT PENTING):
-- Untuk menghitung omzet / pendapatan, GUNAKAN kolom 'total_amount' di tabel transactions. JANGAN pernah menggunakan kolom net_amount atau total_price.
-- Hubungkan transactions ke transaction_details via: transactions.id = transaction_details.transaction_id
-- User adalah owner store_id = ${activeUser.store_id}. WAJIB sertakan filter "WHERE store_id = ${activeUser.store_id}" di tabel transactions pada SETIAP query.
-- Anggap saat ini adalah tahun 2026.
+1. stores               (id, store_name, location)
+2. whatsapp_users       (phone_number, store_id, owner_name, created_at)
+3. menu_categories      (id, store_id, name)
+4. menu_items           (id, store_id, category_id, name, price)
+5. menu_recipes         (id, menu_item_id, inventory_id, qty_used)
+6. inventory            (id, store_id, item_name, unit, current_stock)
+7. transactions         (id, store_id, receipt_number, order_type, table_number, transaction_date, total_amount, payment_method)
+8. transaction_details  (id, transaction_id, menu_item_id, qty, subtotal, notes)
+9. cash_logs            (id, store_id, type, amount, description, created_at)
 
-Tugas: Kembalikan HANYA teks query SQL PostgreSQL mentah dalam SATU BARIS tanpa penjelasan, tanpa pengantar, dan tanpa markdown.`;
+RELASI ANTAR TABEL:
+- transactions.id        = transaction_details.transaction_id
+- transaction_details.menu_item_id = menu_items.id
+- menu_items.category_id = menu_categories.id
+- menu_items.id          = menu_recipes.menu_item_id
+- menu_recipes.inventory_id = inventory.id
+- cash_logs.store_id     = stores.id
 
-        console.log("   [⏳ Step A: LLaMA sedang merakit SQL...]");
+ATURAN SQL (SANGAT PENTING):
+- WAJIB gunakan alias tabel agar tidak ambigu (contoh: transactions t, transaction_details td, menu_items mi).
+- WAJIB sertakan filter store_id = ${activeUser.store_id} di setiap query yang menyentuh tabel: transactions, inventory, menu_items, menu_categories, atau cash_logs.
+- Untuk omzet/pendapatan gunakan SUM(t.total_amount) dari tabel transactions.
+- Untuk penjualan per menu gunakan SUM(td.qty) dan SUM(td.subtotal) dari transaction_details JOIN transactions.
+- Gunakan COALESCE(..., 0) untuk mencegah hasil NULL.
+- Anggap saat ini bulan April 2026. Gunakan CURRENT_DATE untuk filter tanggal.
+- 🚨 ANTI-TYPO NAMA MENU: WAJIB gunakan ILIKE dengan wildcard %. Contoh: mi.name ILIKE '%ayam%'. DILARANG pakai operator = untuk nama menu.
+- Untuk pertanyaan tentang kas/cash flow, gunakan tabel cash_logs (type: 'in' = pemasukan, 'out' = pengeluaran).
+
+Tugas: Kembalikan HANYA teks query SQL PostgreSQL mentah dalam SATU BARIS tanpa penjelasan apapun.`;
+
+        console.log("   [⏳ Step A: Nemotron sedang merakit SQL...]");
         const promptToSQL = `${SYSTEM_PROMPT}\n\nPertanyaan: "${message}"\nQuery SQL:`;
-        let sqlQuery = await callLlama(promptToSQL);
+        let sqlQuery = await callNemotron(promptToSQL, false); // thinking OFF
         sqlQuery = sqlQuery.replace(/```sql/ig, '').replace(/```/g, '').trim();
 
         if (!sqlQuery.includes(String(activeUser.store_id))) {
@@ -117,40 +145,43 @@ Tugas: Kembalikan HANYA teks query SQL PostgreSQL mentah dalam SATU BARIS tanpa 
         console.log("   [💻 Execute SQL]:", sqlQuery);
         const dbResult = await sql.unsafe(sqlQuery);
 
-        console.log("   [⏳ Step B: Eksekusi ke Database Supabase Sukses...]");
-
-        // Pangkas hasil database untuk menghemat token
+        // Diet Token untuk Step C
         const safeData = dbResult.length > 15 ? dbResult.slice(0, 15) : dbResult;
         let dataToAI = JSON.stringify(safeData);
         if (dbResult.length > 15) {
             dataToAI += `\n(Info: Ini 15 data teratas. Total asli ${dbResult.length} baris).`;
         }
 
-        console.log("   [⏳ Step C: LLaMA menyusun jawaban Tantri...]");
+        // 🧠 PROMPT STEP C: PENYUSUN JAWABAN (thinking ON — lebih natural & cerdas)
+        console.log("   [⏳ Step C: Nemotron menyusun jawaban Tantri...]");
         const promptToSummary = `
-Kamu adalah asisten Cafe bernama Tantri. 
-Jawab pertanyaan owner "${message}" SECARA KETAT berdasarkan data JSON ini saja: ${dataToAI}.
+Kamu adalah Tantri, asisten cafe yang hangat, sabar, dan selalu bikin owner merasa nyaman.
+Gaya bicaramu seperti teman dekat yang kebetulan jago angka — santai, tapi tetap informatif.
 
-ATURAN ANTI-HALUSINASI (SANGAT PENTING):
-1. DILARANG KERAS mengarang, menebak, atau membuat asumsi tentang harga, nama menu, atau nominal uang yang TIDAK ADA di dalam data JSON tersebut.
-2. Jika di dalam JSON hanya ada data jumlah porsi (qty), maka sebutkan jumlah porsinya saja! JANGAN mencoba menghitung total pendapatan sendiri.
-3. Jangan menggunakan kata "asumsi", "perkiraan", atau "misalnya" terkait data keuangan.
-4. Jika datanya kosong atau 0, sampaikan saja apa adanya dengan sopan.
+Pertanyaan owner: "${message}"
+Data dari database: ${dataToAI}
 
-Berikan jawaban kasual, ramah, dan insight singkat (tapi hanya berdasarkan fakta dari JSON). Format angka besar ke Rupiah.`;
-        const finalAnswer = await callLlama(promptToSummary);
+Cara menjawab:
+- Gunakan bahasa Indonesia yang lembut dan natural, seperti ngobrol biasa. Boleh sesekali pakai "Bos" dengan nada akrab.
+- Jika datanya ada, sampaikan hasilnya dengan hangat dan tambahkan satu insight kecil yang relevan.
+- Jika datanya kosong atau null, sampaikan dengan empati — jangan kaku. Contoh: "Kayaknya belum ada transaksi untuk itu, Bos 😊".
+- Format angka ke Rupiah (contoh: Rp 1.250.000).
+- Jangan pernah tampilkan format JSON atau kode ke owner.
+- Jangan mengarang angka yang tidak ada di data.`;
+
+        const finalAnswer = await callNemotron(promptToSummary, true); // thinking ON
 
         console.log("   [✅ Selesai: Mengirim ke UI Web]");
         res.json({
             success: true,
             answer: finalAnswer,
             sql: sqlQuery,
-            rawData: safeData 
+            rawData: safeData
         });
 
     } catch (error) {
         console.error("❌ Error path:", error.message);
-        res.status(500).json({ success: false, answer: "Maaf Bos, sistem lagi agak pusing baca datanya.", error: error.message });
+        res.status(500).json({ success: false, answer: "Aduh Bos, ada kendala teknis saat menarik data. Coba lagi ya.", error: error.message });
     }
 });
 
@@ -158,7 +189,7 @@ const PORT = 3000;
 app.listen(PORT, () => {
     console.log(`
 =========================================
-🚀 SERVER LLaMA-MAVERICK AKTIF
+🚀 SERVER NVIDIA NEMOTRON AKTIF
 🔗 Akses di: http://localhost:${PORT}
 =========================================
     `);
