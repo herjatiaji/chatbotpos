@@ -1,0 +1,47 @@
+# ==============================
+# DEPENDENCIES
+# ==============================
+node_modules/
+package-lock.json
+
+# ==============================
+# ENVIRONMENT VARIABLES (CRITICAL)
+# ==============================
+# JANGAN PERNAH hapus baris ini. Ini menjaga API Key dan Password DB Anda tetap aman.
+.env
+.env.*
+!.env.example
+
+# ==============================
+# LOGS & DEBUG
+# ==============================
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# ==============================
+# OS GENERATED FILES
+# ==============================
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# ==============================
+# EDITOR & IDE (VS CODE)
+# ==============================
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
