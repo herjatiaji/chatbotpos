@@ -3,11 +3,36 @@ import express from 'express';
 import sql from './db.js';
 import { callGemini } from './aiService.js';
 import { sendWhatsAppMessage } from './whatsappService.js';
+import path from 'path';
+import { fileURLToPath } from 'url';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 const app = express();
 app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
+
+// Serve Demo UI
+app.get('/', (req, res) => {
+    res.sendFile(path.join(__dirname, 'demo.html'));
+});
+
+// Demo API Endpoint
+app.post('/api/demo/chat', async (req, res) => {
+    const { phone, message } = req.body;
+    if (!phone || !message) {
+        return res.status(400).json({ error: "Phone and message are required" });
+    }
+
+    try {
+        const reply = await processMessage(phone, message, true);
+        res.json({ reply });
+    } catch (err) {
+        res.status(500).json({ error: "Internal Server Error" });
+    }
+});
 
 // Webhook Verification (Meta Challenge)
 app.get('/webhook', (req, res) => {
@@ -30,7 +55,7 @@ app.get('/webhook', (req, res) => {
 });
 
 // Helper function to process the message asynchronously
-async function processMessage(phoneNumber, messageText) {
+async function processMessage(phoneNumber, messageText, returnResponse = false) {
     try {
         // Stateless User Verification: Check DB for user on every message
         const userCheck = await sql`
@@ -42,7 +67,9 @@ async function processMessage(phoneNumber, messageText) {
 
         if (userCheck.length === 0) {
             console.log(`[AUTH FAILED] Unknown number: ${phoneNumber}`);
-            await sendWhatsAppMessage(phoneNumber, "❌ Maaf, nomor Anda tidak terdaftar dalam sistem kami.");
+            const errorMsg = "❌ Maaf, nomor Anda tidak terdaftar dalam sistem kami.";
+            if (returnResponse) return errorMsg;
+            await sendWhatsAppMessage(phoneNumber, errorMsg);
             return;
         }
 
@@ -99,12 +126,16 @@ Jawaban Anda:`;
         const finalAnswer = await callGemini(promptToSummary);
         console.log(`\n🤖 Bot Kopi Wilwatikta to ${phoneNumber}:\n${finalAnswer}\n`);
 
+        if (returnResponse) return finalAnswer;
+
         // Send the response back to user via WhatsApp
         await sendWhatsAppMessage(phoneNumber, finalAnswer);
 
     } catch (error) {
         console.error("\n❌ Terjadi kesalahan query/AI:", error.message);
-        await sendWhatsAppMessage(phoneNumber, "❌ Maaf, terjadi kesalahan pada sistem AI atau Database kami. Coba ubah susunan kalimat pertanyaan Anda atau coba lagi nanti.");
+        const errorMsg = "❌ Maaf, terjadi kesalahan pada sistem AI atau Database kami. Coba ubah susunan kalimat pertanyaan Anda atau coba lagi nanti.";
+        if (returnResponse) return errorMsg;
+        await sendWhatsAppMessage(phoneNumber, errorMsg);
     }
 }
 
@@ -140,7 +171,7 @@ app.post('/webhook', (req, res) => {
     }
 });
 
-app.listen(PORT, () => {
+app.listen(PORT, '0.0.0.0', () => {
     console.log("=========================================");
     console.log(`🚀 CAFE AI ANALYST (EXPRESS WEBHOOK) AKTIF di port ${PORT}`);
     console.log("=========================================\n");
