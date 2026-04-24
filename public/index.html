@@ -7,8 +7,30 @@
     <script src="https://cdn.tailwindcss.com"></script>
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
     <style>
-        .chat-container { height: calc(100vh - 200px); }
+        .chat-container { height: calc(100vh - 200px); scroll-behavior: smooth; }
         .glass { background: rgba(255, 255, 255, 0.95); backdrop-filter: blur(10px); }
+        
+        /* Animasi 3 Titik (Typing Indicator) */
+        .dot-typing {
+            display: flex;
+            gap: 4px;
+            align-items: center;
+            height: 20px;
+        }
+        .dot {
+            width: 8px;
+            height: 8px;
+            background-color: #3b82f6; /* Warna biru Tailwind */
+            border-radius: 50%;
+            animation: bounceScale 1.4s infinite ease-in-out both;
+        }
+        .dot:nth-child(1) { animation-delay: -0.32s; }
+        .dot:nth-child(2) { animation-delay: -0.16s; }
+        
+        @keyframes bounceScale {
+            0%, 80%, 100% { transform: scale(0); opacity: 0.5; }
+            40% { transform: scale(1); opacity: 1; }
+        }
     </style>
 </head>
 <body class="bg-slate-100 font-sans">
@@ -35,7 +57,7 @@
                     </div>
                     <div>
                         <h3 class="font-bold text-slate-700">AI Assistant</h3>
-                        <p class="text-xs text-green-500"><i class="fa-solid fa-circle text-[8px]"></i> Online | Siap membantu</p>
+                        <p class="text-xs text-green-500"><i class="fa-solid fa-circle text-[8px] animate-pulse"></i> Online | Siap membantu</p>
                     </div>
                 </div>
 
@@ -50,8 +72,8 @@
                 <div class="p-4 bg-white border-t">
                     <form id="chatForm" class="flex gap-2">
                         <input type="text" id="userInput" placeholder="Ketik pertanyaan (cth: Berapa omzet hari ini?)" 
-                               class="flex-1 border rounded-full px-6 py-3 focus:ring-2 focus:ring-blue-500 outline-none bg-slate-50">
-                        <button type="submit" class="bg-blue-600 hover:bg-blue-700 text-white w-12 h-12 rounded-full transition-all flex items-center justify-center">
+                               class="flex-1 border rounded-full px-6 py-3 focus:ring-2 focus:ring-blue-500 outline-none bg-slate-50 transition-all">
+                        <button type="submit" id="sendBtn" class="bg-blue-600 hover:bg-blue-700 text-white w-12 h-12 rounded-full transition-all flex items-center justify-center disabled:opacity-50 disabled:cursor-not-allowed">
                             <i class="fa-solid fa-paper-plane"></i>
                         </button>
                     </form>
@@ -63,7 +85,7 @@
                     <h3 class="font-bold text-slate-800 mb-4 flex items-center gap-2">
                         <i class="fa-solid fa-code text-blue-500"></i> SQL Inspector
                     </h3>
-                    <div id="sqlDisplay" class="bg-slate-900 text-green-400 p-4 rounded-xl text-xs font-mono min-h-[100px] break-all leading-relaxed">
+                    <div id="sqlDisplay" class="bg-slate-900 text-green-400 p-4 rounded-xl text-xs font-mono min-h-[100px] break-all leading-relaxed transition-all">
                         -- SQL Query akan muncul di sini saat AI bekerja...
                     </div>
                 </div>
@@ -72,9 +94,7 @@
                     <h3 class="font-bold text-slate-800 mb-4 flex items-center gap-2">
                         <i class="fa-solid fa-database text-amber-500"></i> Database Result (JSON)
                     </h3>
-                    <pre id="jsonDisplay" class="bg-slate-50 text-slate-600 p-4 rounded-xl text-[10px] font-mono overflow-x-auto max-h-[300px]">
-{}
-                    </pre>
+                    <pre id="jsonDisplay" class="bg-slate-50 text-slate-600 p-4 rounded-xl text-[10px] font-mono overflow-x-auto max-h-[300px] min-h-[100px] border border-slate-200 transition-all">{}</pre>
                 </div>
             </div>
         </div>
@@ -87,12 +107,13 @@
         const userSelector = document.getElementById('userSelector');
         const sqlDisplay = document.getElementById('sqlDisplay');
         const jsonDisplay = document.getElementById('jsonDisplay');
+        const sendBtn = document.getElementById('sendBtn');
 
         function addMessage(text, isUser = false) {
             const div = document.createElement('div');
             div.className = `flex ${isUser ? 'justify-end' : 'justify-start'}`;
             div.innerHTML = `
-                <div class="${isUser ? 'bg-blue-600 text-white rounded-tr-none' : 'bg-white text-slate-700 rounded-tl-none'} p-4 rounded-2xl shadow-sm max-w-[85%]">
+                <div class="${isUser ? 'bg-blue-600 text-white rounded-tr-none' : 'bg-white text-slate-700 rounded-tl-none'} p-4 rounded-2xl shadow-sm max-w-[85%] leading-relaxed">
                     ${text}
                 </div>
             `;
@@ -106,16 +127,37 @@
             const phone = userSelector.value;
             if (!text) return;
 
+            // Kunci input dan tombol selama proses
+            userInput.disabled = true;
+            sendBtn.disabled = true;
+
             addMessage(text, true);
             userInput.value = '';
 
-            // Loading state
-            const loadingId = Date.now();
+            // 🌟 ANIMASI LOADING CHATBOX
+            const loadingId = `loading-${Date.now()}`;
             const loadingDiv = document.createElement('div');
             loadingDiv.id = loadingId;
-            loadingDiv.className = 'flex justify-start italic text-slate-400 text-sm';
-            loadingDiv.innerText = 'AI Assistant sedang berpikir...';
+            loadingDiv.className = 'flex justify-start';
+            loadingDiv.innerHTML = `
+                <div class="bg-white p-3 rounded-2xl rounded-tl-none shadow-sm flex items-center gap-3 border border-blue-50">
+                    <div class="w-8 h-8 bg-blue-100 rounded-full flex items-center justify-center text-blue-600">
+                        <i class="fa-solid fa-robot fa-bounce" style="--fa-animation-iteration-count: infinite; --fa-animation-duration: 2s;"></i>
+                    </div>
+                    <div class="dot-typing px-2">
+                        <div class="dot"></div>
+                        <div class="dot"></div>
+                        <div class="dot"></div>
+                    </div>
+                    <span class="text-[11px] font-medium text-slate-400 mr-2 uppercase tracking-wider">Memproses...</span>
+                </div>
+            `;
             chatBox.appendChild(loadingDiv);
+            chatBox.scrollTop = chatBox.scrollHeight;
+
+            // 🌟 ANIMASI LOADING PANEL SQL & JSON
+            sqlDisplay.innerHTML = '<span class="text-slate-500 animate-pulse">Menghubungkan & merakit SQL...</span>';
+            jsonDisplay.innerHTML = '<span class="text-slate-400 animate-pulse">Menunggu data...</span>';
 
             try {
                 const response = await fetch('/api/chat', {
@@ -125,18 +167,32 @@
                 });
 
                 const data = await response.json();
+                
+                // Hapus loading
                 document.getElementById(loadingId).remove();
 
                 if (data.success) {
                     addMessage(data.answer);
-                    sqlDisplay.innerText = data.sql;
-                    jsonDisplay.innerText = JSON.stringify(data.rawData, null, 2);
+                    sqlDisplay.innerHTML = data.sql;
+                    // Format JSON dengan highlight syntax simpel
+                    jsonDisplay.innerHTML = JSON.stringify(data.rawData, null, 2);
                 } else {
                     addMessage("Waduh, maaf Bos, ada gangguan teknis.");
+                    sqlDisplay.innerHTML = '<span class="text-red-400">-- Error pada SQL Generation --</span>';
+                    jsonDisplay.innerHTML = '{}';
                 }
             } catch (err) {
                 console.error(err);
-                document.getElementById(loadingId).innerText = "Koneksi terputus.";
+                document.getElementById(loadingId).remove();
+                addMessage("❌ Koneksi terputus. Pastikan server nyala Bos.");
+                sqlDisplay.innerHTML = '-- Disconnected --';
+                jsonDisplay.innerHTML = '{}';
+            } finally {
+                // Buka kembali input setelah selesai
+                userInput.disabled = false;
+                sendBtn.disabled = false;
+                userInput.focus();
+                chatBox.scrollTop = chatBox.scrollHeight;
             }
         });
     </script>
