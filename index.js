@@ -9,16 +9,15 @@ const rl = readline.createInterface({
 });
 
 // Fungsi memanggil Gemini API (Dengan Auto-Retry Anti-Overload)
-// Fungsi memanggil Gemini API (Dengan Auto-Retry yang Sempurna)
-async function callGemini(promptText, retries = 3, delay = 2000) {
-    const modelName = 'gemini-2.5-flash'; 
+async function callGemini(promptText, retries = 3, delay = 5000) {
+    const modelName = 'gemini-2.0-flash';
 
     if (!process.env.GEMINI_API_KEY) {
         throw new Error("GEMINI_API_KEY kosong!");
     }
 
     const url = `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${process.env.GEMINI_API_KEY}`;
-    
+
     for (let i = 0; i < retries; i++) {
         try {
             const response = await fetch(url, {
@@ -35,28 +34,36 @@ async function callGemini(promptText, retries = 3, delay = 2000) {
 
             if (!response.ok) {
                 const errorDetail = await response.text();
-                // Jika server overload
+
+                // Jika server overload, retry
                 if (response.status === 503 || response.status === 429) {
-                    console.log(`   [⚠️ Server sibuk. Mencoba ulang dalam ${delay/1000} detik... (Percobaan ${i+1}/${retries})]`);
-                    
-                    // JIKA INI PERCOBAAN TERAKHIR, LEMPAR ERROR (Jangan continue)
+                    console.log(`   [⚠️ Server sibuk. Mencoba ulang dalam ${delay / 1000} detik... (Percobaan ${i + 1}/${retries})]`);
+
                     if (i === retries - 1) {
                         throw new Error("Server AI sedang overload parah. Mohon coba lagi dalam beberapa menit.");
                     }
-                    
+
                     await new Promise(res => setTimeout(res, delay));
-                    delay *= 2; 
-                    continue; 
+                    delay *= 2;
+                    continue;
                 }
+
+                // Error lain langsung lempar
                 throw new Error(`Google API Error (${response.status}): ${errorDetail}`);
             }
-            
+
             const data = await response.json();
             return data.candidates[0].content.parts[0].text.trim();
 
         } catch (error) {
-            // Tangkap dan lempar error agar tidak me-return undefined
-            if (i === retries - 1) throw error;
+            // ✅ FIX: Hanya retry untuk error overload; error lain langsung dilempar
+            const isOverload = error.message.includes('503') || error.message.includes('429');
+            if (i === retries - 1 || !isOverload) {
+                throw error;
+            }
+            console.log(`   [⚠️ Koneksi error. Mencoba ulang dalam ${delay / 1000} detik... (Percobaan ${i + 1}/${retries})]`);
+            await new Promise(res => setTimeout(res, delay));
+            delay *= 2;
         }
     }
 }
@@ -71,7 +78,7 @@ async function startApp() {
 
     // 1. Simulasi Login WhatsApp (Cek Nomor)
     rl.question('📲 Masukkan Nomor WA Anda (contoh: 62811111111): ', async (phoneNumber) => {
-        
+
         try {
             // Cek apakah nomor terdaftar di database
             const userCheck = await sql`
@@ -130,26 +137,36 @@ Gunakan CURRENT_DATE untuk referensi hari ini (Anggap saat ini bulan April 2026)
                         // A. Natural Language ke SQL
                         console.log("   [⏳ AI sedang membuat query...]");
                         const promptToSQL = `${SYSTEM_PROMPT}\n\nPertanyaan Owner: "${userInput}"\nQuery SQL:`;
-                        
+
                         let sqlQuery = await callGemini(promptToSQL);
-                        
-                        // BEST PRACTICE: Bersihkan markdown secara paksa dengan Regex
+
+                        // Bersihkan markdown secara paksa dengan Regex
                         sqlQuery = sqlQuery.replace(/```sql/ig, '').replace(/```/g, '').trim();
-                        
+
                         console.log("   [💻 Executing SQL]:\n", sqlQuery);
 
+                        // ✅ FIX: Validasi keamanan — pastikan query mengandung store_id milik user
+                        if (!sqlQuery.includes(String(activeUser.store_id))) {
+                            throw new Error("Query tidak aman: tidak ada filter store_id! Coba ulangi pertanyaan Anda.");
+                        }
+
                         // B. Eksekusi Query ke Supabase
-                        const dbResult = await sql.unsafe(sqlQuery);    
+                        const dbResult = await sql.unsafe(sqlQuery);
+
+                        // ✅ FIX: Jeda 1 detik antar call supaya tidak kena rate limit
+                        await new Promise(res => setTimeout(res, 1000));
 
                         // C. SQL Result ke Natural Language
                         console.log("   [⏳ AI sedang menyusun jawaban...]");
+
+                        // ✅ FIX: Ganti `rawData` (undefined) dengan JSON.stringify(dbResult)
                         const promptToSummary = `
 Kamu adalah asisten Cafe yang pintar bernama Tantri. 
 Berdasarkan pertanyaan owner dan data JSON mentah berikut, berikan jawaban kasual, ramah, dan berikan insight singkat.
 Pertanyaan: "${userInput}"
-Data DB: ${rawData}
+Data DB: ${JSON.stringify(dbResult)}
 Jawaban Anda:`;
-                        
+
                         const finalAnswer = await callGemini(promptToSummary);
                         console.log(`\n🤖 Bot Kopi Wilwatikta:\n${finalAnswer}\n`);
                         console.log("--------------------------------------------------");
