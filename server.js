@@ -29,7 +29,6 @@ async function callNemotron(promptText, enableThinking = false, retries = 3, del
 
     for (let i = 0; i < retries; i++) {
         try {
-            // Kita gunakan model Nemotron 3 (Pastikan nama model sesuai di dashboard NVIDIA)
             const modelName = 'nvidia/nemotron-3-super-120b-a12b';
             
             const response = await openai.chat.completions.create({
@@ -38,7 +37,6 @@ async function callNemotron(promptText, enableThinking = false, retries = 3, del
                 temperature: enableThinking ? 1 : 0.1,
                 top_p: 0.95,
                 max_tokens: enableThinking ? 4096 : 2048,
-                // Sesuai dokumentasi NVIDIA NIM, ini dikirim via extra_body jika SDK tidak mendukung langsung
                 extra_body: {
                     reasoning_budget: enableThinking ? 4096 : 0,
                 },
@@ -47,21 +45,18 @@ async function callNemotron(promptText, enableThinking = false, retries = 3, del
 
             let fullContent = '';
             for await (const chunk of response) {
-                // Log pergerakan chunk di terminal agar kita tahu server tidak mati
                 const content = chunk.choices[0]?.delta?.content || '';
                 fullContent += content;
-                if (enableThinking && content) process.stdout.write("."); // Titik progress
+                if (enableThinking && content) process.stdout.write("."); 
             }
 
             return fullContent.trim();
 
         } catch (error) {
-            // 🔥 LOG ERROR DETAIL UNTUK DEBUGGING
             console.error(`\n[🚨 API ERROR - Percobaan ${i+1}]`);
             console.error(`   - Status: ${error.status || 'Unknown'}`);
             console.error(`   - Message: ${error.message}`);
             
-            // Cek apakah error karena limit kuota
             const isRateLimit = error.status === 429 || error.message.includes('429');
             const isServerOverload = error.status === 503 || error.message.includes('503');
 
@@ -76,6 +71,7 @@ async function callNemotron(promptText, enableThinking = false, retries = 3, del
         }
     }
 }
+
 // ==========================================
 // API ENDPOINT
 // ==========================================
@@ -93,12 +89,12 @@ app.post('/api/chat', async (req, res) => {
         `;
 
         if (userCheck.length === 0) {
-            return res.status(403).json({ success: false, answer: "Maaf, nomor tidak terdaftar." });
+            return res.status(403).json({ success: false, answer: "Mohon maaf, nomor Anda tidak terdaftar dalam sistem kami." });
         }
 
         const activeUser = userCheck[0];
 
-        // 🧠 PROMPT STEP A: PEMBUAT SQL (thinking OFF — deterministik)
+        // 🧠 PROMPT STEP A: PEMBUAT SQL (Dengan Aturan Laba/Rugi Baru)
         const SYSTEM_PROMPT = `
 Kamu adalah AI Data Analyst operasional Cafe.
 Database PostgreSQL memiliki skema KETAT berikut (HANYA GUNAKAN KOLOM YANG ADA DI SINI):
@@ -122,20 +118,17 @@ RELASI ANTAR TABEL:
 - cash_logs.store_id     = stores.id
 
 ATURAN SQL (SANGAT PENTING):
-- WAJIB gunakan alias tabel agar tidak ambigu (contoh: transactions t, transaction_details td, menu_items mi).
-- WAJIB sertakan filter store_id = ${activeUser.store_id} di setiap query yang menyentuh tabel: transactions, inventory, menu_items, menu_categories, atau cash_logs.
-- Untuk omzet/pendapatan gunakan SUM(t.total_amount) dari tabel transactions.
-- Untuk penjualan per menu gunakan SUM(td.qty) dan SUM(td.subtotal) dari transaction_details JOIN transactions.
-- Gunakan COALESCE(..., 0) untuk mencegah hasil NULL.
+- WAJIB gunakan alias tabel agar tidak ambigu.
+- WAJIB sertakan filter store_id = ${activeUser.store_id} di setiap query.
 - Anggap saat ini bulan April 2026. Gunakan CURRENT_DATE untuk filter tanggal.
-- 🚨 ANTI-TYPO NAMA MENU: WAJIB gunakan ILIKE dengan wildcard %. Contoh: mi.name ILIKE '%ayam%'. DILARANG pakai operator = untuk nama menu.
-- Untuk pertanyaan tentang kas/cash flow, gunakan tabel cash_logs (type: 'in' = pemasukan, 'out' = pengeluaran).
+- 🚨 ANTI-TYPO NAMA MENU: WAJIB gunakan ILIKE dengan wildcard %. DILARANG pakai operator = untuk nama menu.
+- 🚨 ATURAN LABA/RUGI & KEUANGAN: Jika ditanya "Laba", "Rugi", atau "Rekap", gunakan kombinasi dari tabel 'transactions' (sebagai omzet/pendapatan) dan 'cash_logs' type 'out' (sebagai pengeluaran). JANGAN menghitung cash_logs type 'in' yang deskripsinya mengandung kata 'Modal' sebagai pendapatan operasional.
 
 Tugas: Kembalikan HANYA teks query SQL PostgreSQL mentah dalam SATU BARIS tanpa penjelasan apapun.`;
 
         console.log("   [⏳ Step A: Nemotron sedang merakit SQL...]");
         const promptToSQL = `${SYSTEM_PROMPT}\n\nPertanyaan: "${message}"\nQuery SQL:`;
-        let sqlQuery = await callNemotron(promptToSQL, false); // thinking OFF
+        let sqlQuery = await callNemotron(promptToSQL, false); 
         sqlQuery = sqlQuery.replace(/```sql/ig, '').replace(/```/g, '').trim();
 
         if (!sqlQuery.includes(String(activeUser.store_id))) {
@@ -145,31 +138,32 @@ Tugas: Kembalikan HANYA teks query SQL PostgreSQL mentah dalam SATU BARIS tanpa 
         console.log("   [💻 Execute SQL]:", sqlQuery);
         const dbResult = await sql.unsafe(sqlQuery);
 
-        // Diet Token untuk Step C
         const safeData = dbResult.length > 15 ? dbResult.slice(0, 15) : dbResult;
         let dataToAI = JSON.stringify(safeData);
         if (dbResult.length > 15) {
             dataToAI += `\n(Info: Ini 15 data teratas. Total asli ${dbResult.length} baris).`;
         }
 
-        // 🧠 PROMPT STEP C: PENYUSUN JAWABAN (thinking ON — lebih natural & cerdas)
-        console.log("   [⏳ Step C: Nemotron menyusun jawaban Tantri...]");
+        // 🧠 PROMPT STEP C: PENYUSUN JAWABAN (Persona Profesional & Formal)
+        console.log("   [⏳ Step C: Nemotron menyusun jawaban akhir...]");
         const promptToSummary = `
-Kamu adalah Tantri, asisten cafe yang hangat, sabar, dan selalu bikin owner merasa nyaman.
-Gaya bicaramu seperti teman dekat yang kebetulan jago angka — santai, tapi tetap informatif.
+Kamu adalah Asisten Data Analyst yang profesional, sopan, dan formal.
+Tugasmu adalah membacakan data pelaporan keuangan/operasional kepada pihak manajemen.
 
-Pertanyaan owner: "${message}"
+Pertanyaan pengguna: "${message}"
 Data dari database: ${dataToAI}
 
 Cara menjawab:
-- Gunakan bahasa Indonesia yang lembut dan natural, seperti ngobrol biasa. Boleh sesekali pakai "Bos" dengan nada akrab.
-- Jika datanya ada, sampaikan hasilnya dengan hangat dan tambahkan satu insight kecil yang relevan.
-- Jika datanya kosong atau null, sampaikan dengan empati — jangan kaku. Contoh: "Kayaknya belum ada transaksi untuk itu, Bos 😊".
-- Format angka ke Rupiah (contoh: Rp 1.250.000).
-- Jangan pernah tampilkan format JSON atau kode ke owner.
-- Jangan mengarang angka yang tidak ada di data.`;
+- Gunakan bahasa Indonesia yang baku, formal, dan profesional. 
+- DILARANG KERAS menggunakan bahasa gaul, kata sapaan santai seperti "Bos", "Bro", atau gaya bahasa yang terkesan sok asik. 
+- Sapa pengguna dengan "owner/pemilik" atau cukup sampaikan laporan secara langsung dan elegan.
+- Jika datanya ada, sampaikan hasilnya secara terstruktur dan tambahkan satu insight bisnis singkat yang relevan berdasarkan data tersebut.
+- Jika datanya kosong atau bernilai null, sampaikan dengan sopan. Contoh: "Mohon maaf, saat ini belum ada data transaksi untuk periode tersebut."
+- Format angka ke Rupiah dengan rapi (contoh: Rp 1.250.000).
+- Jangan pernah tampilkan format JSON atau kode kepada pengguna.
+- DILARANG mengarang angka yang tidak ada di data.`;
 
-        const finalAnswer = await callNemotron(promptToSummary, true); // thinking ON
+        const finalAnswer = await callNemotron(promptToSummary, true); 
 
         console.log("   [✅ Selesai: Mengirim ke UI Web]");
         res.json({
@@ -181,11 +175,15 @@ Cara menjawab:
 
     } catch (error) {
         console.error("❌ Error path:", error.message);
-        res.status(500).json({ success: false, answer: "Aduh Bos, ada kendala teknis saat menarik data. Coba lagi ya.", error: error.message });
+        // Ubah juga pesan error darurat agar lebih formal
+        res.status(500).json({ 
+            success: false, 
+            answer: "Mohon maaf, terjadi kendala teknis saat menarik data dari server. Silakan coba beberapa saat lagi.", 
+            error: error.message 
+        });
     }
 });
 
-// Ganti baris const PORT = 3000; menjadi:
 const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, '0.0.0.0', () => {
