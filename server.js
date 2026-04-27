@@ -3,21 +3,12 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import 'dotenv/config';
 import sql from './db.js';
-import OpenAI from 'openai';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
 
 app.use(express.json());
 app.use(express.static('public'));
-
-// ==========================================
-// KONFIGURASI NVIDIA NIM
-// ==========================================
-const openai = new OpenAI({
-    apiKey: process.env.NVIDIA_API_KEY,
-    baseURL: 'https://integrate.api.nvidia.com/v1',
-});
 
 // ==========================================
 // MULTI-TENANT: Rate limiter per store
@@ -92,50 +83,83 @@ function validateSQL(sqlQuery, storeId) {
 }
 
 // ==========================================
-// AI ENGINE
+// 🔥 AI ENGINE (Llama 4 Maverick via NATIVE FETCH)
 // ==========================================
-async function callNemotron(promptText, enableThinking = false, retries = 3, delay = 5000) {
+async function callAI(promptText, enableThinking = false, retries = 3, delay = 5000) {
     if (!process.env.NVIDIA_API_KEY) throw new Error('NVIDIA_API_KEY kosong!');
+
+    const invokeUrl = "https://integrate.api.nvidia.com/v1/chat/completions";
+    const headers = {
+        "Authorization": `Bearer ${process.env.NVIDIA_API_KEY}`,
+        "Accept": "text/event-stream",
+        "Content-Type": "application/json"
+    };
+
+    const payload = {
+        "model": "meta/llama-4-maverick-17b-128e-instruct",
+        "messages": [{"role": "user", "content": promptText}],
+        "max_tokens": 4096,
+        "temperature": enableThinking ? 0.6 : 0.1,
+        "top_p": 0.95,
+        "stream": true
+    };
 
     for (let i = 0; i < retries; i++) {
         try {
-            const stream = await openai.chat.completions.create({
-                model: 'nvidia/nemotron-3-super-120b-a12b',
-                messages: [{ role: 'user', content: promptText }],
-                temperature: enableThinking ? 1 : 0.1,
-                top_p: 0.95,
-                max_tokens: enableThinking ? 4096 : 2048,
-                reasoning_budget: enableThinking ? 4096 : 0,
-                chat_template_kwargs: { enable_thinking: enableThinking },
-                stream: true,
+            const response = await fetch(invokeUrl, {
+                method: 'POST',
+                headers: headers,
+                body: JSON.stringify(payload)
             });
 
-            let fullContent = '';
-            let reasoningBuffer = '';
-            for await (const chunk of stream) {
-                const delta = chunk.choices[0]?.delta;
-                // Skip reasoning_content — hanya ambil content final
-                if (delta?.reasoning_content) {
-                    reasoningBuffer += delta.reasoning_content;
+            if (!response.ok) {
+                const isOverload = response.status === 503 || response.status === 429;
+                if (i === retries - 1 || !isOverload) {
+                    throw new Error(`HTTP error! status: ${response.status}`);
                 }
-                if (delta?.content) {
-                    fullContent += delta.content;
+                await new Promise(res => setTimeout(res, delay));
+                delay *= 2;
+                continue;
+            }
+
+            // Membaca stream menggunakan Web Streams API
+            const reader = response.body.getReader();
+            const decoder = new TextDecoder('utf-8');
+            let fullContent = '';
+            let buffer = '';
+
+            while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+
+                buffer += decoder.decode(value, { stream: true });
+                const lines = buffer.split('\n');
+                
+                // Simpan baris terakhir ke buffer karena mungkin belum komplit
+                buffer = lines.pop();
+
+                for (const line of lines) {
+                    if (line.startsWith('data: ')) {
+                        const dataStr = line.substring(6).trim();
+                        if (dataStr === '[DONE]') continue;
+
+                        try {
+                            const parsed = JSON.parse(dataStr);
+                            if (parsed.choices && parsed.choices[0] && parsed.choices[0].delta && parsed.choices[0].delta.content) {
+                                fullContent += parsed.choices[0].delta.content;
+                            }
+                        } catch (e) {
+                            // Abaikan error parsing JSON stream yang terpotong
+                        }
+                    }
                 }
             }
-            // Bersihkan sisa thinking yang bocor ke content (pola bahasa Inggris di awal)
-            let cleaned = fullContent.trim();
-            // Hapus blok <think>...</think> jika ada
-            cleaned = cleaned.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
-            // Hapus baris-baris awal yang seluruhnya bahasa Inggris (reasoning bocor)
-            const lines = cleaned.split('\n');
-            const firstIdLines = lines.findIndex(l => /[a-zA-Z]{4,}/.test(l) === false || /[\u00C0-\u024F\u1E00-\u1EFF]/.test(l) || /^[^a-zA-Z]*$/.test(l));
-            return cleaned;
+
+            return fullContent.trim();
 
         } catch (error) {
             console.log(`   [⚠️ API Error] Percobaan ${i + 1}/${retries}: ${error.message}`);
-            const isOverload = error.status === 503 || error.status === 429 ||
-                               error.message?.includes('503') || error.message?.includes('429');
-            if (i === retries - 1 || !isOverload) throw new Error('Gagal menghubungi server AI.');
+            if (i === retries - 1) throw new Error('Gagal menghubungi server AI.');
             await new Promise(res => setTimeout(res, delay));
             delay *= 2;
         }
@@ -172,9 +196,6 @@ function isChitchat(message) {
 
 // ==========================================
 // HELPER: Deteksi apakah pesan adalah nota/struk
-// Format yang didukung:
-// - "nota: item1 x qty harga, item2 x qty harga"
-// - Teks bebas berisi daftar item & harga
 // ==========================================
 function isNota(message) {
     const notaPatterns = [
@@ -184,7 +205,6 @@ function isNota(message) {
         /baca\s+nota/i,
         /input\s+nota/i,
         /catat\s+nota/i,
-        // Deteksi pola item x qty = harga
         /\d+\s*[xX]\s*\d+/,
         /rp\.?\s*\d{3,}/i,
     ];
@@ -223,7 +243,7 @@ ${notaText}
 
 JSON:`;
 
-    const result = await callNemotron(prompt, false);
+    const result = await callAI(prompt, false);
     try {
         const cleaned = result.replace(/```json/ig, '').replace(/```/g, '').trim();
         return JSON.parse(cleaned);
@@ -251,12 +271,9 @@ function isHPPQuestion(message) {
 }
 
 // ==========================================
-// HPP CALCULATOR: Hitung HPP & margin per menu
-// Mengambil data nyata dari DB: resep, harga jual, dan
-// referensi harga bahan dari cash_logs (jika tersedia)
+// HPP CALCULATOR
 // ==========================================
 async function hitungHPP(storeId, menuKeyword = null) {
-    // Query 1: Resep + harga jual per menu
     const menuFilter = menuKeyword ? `AND mi.name ILIKE '%${menuKeyword}%'` : '';
     const resepData = await sql.unsafe(`
         SELECT
@@ -274,8 +291,6 @@ async function hitungHPP(storeId, menuKeyword = null) {
         ORDER BY mi.name, inv.item_name
     `);
 
-    // Query 2: Referensi harga bahan dari cash_logs
-    // Cari pengeluaran yang deskripsinya mengandung nama bahan
     const hargaRef = await sql.unsafe(`
         SELECT
             inv.item_name,
@@ -290,7 +305,6 @@ async function hitungHPP(storeId, menuKeyword = null) {
         ORDER BY cl.created_at DESC
     `);
 
-    // Susun struktur: per menu → list bahan + referensi harga
     const menuMap = {};
     for (const row of resepData) {
         if (!menuMap[row.nama_menu]) {
@@ -300,7 +314,6 @@ async function hitungHPP(storeId, menuKeyword = null) {
                 bahan: []
             };
         }
-        // Cari referensi harga dari cash_logs
         const ref = hargaRef.filter(h => h.item_name === row.bahan);
         menuMap[row.nama_menu].bahan.push({
             nama: row.bahan,
@@ -359,7 +372,7 @@ app.post('/api/chat', async (req, res) => {
         if (isChitchat(message)) {
             return res.json({
                 success: true,
-                answer: `🤖 *Kazeer AI*\n\nHalo! Saya adalah Kazeer, bot AI Business Consultant kamu untuk ${storeName}.\n\n💡 Saya bisa membantu kamu dengan:\n• 📊 Analisis omzet & transaksi\n• 🏆 Menu terlaris & performa penjualan\n• 📦 Stok & bahan baku\n• 💰 Laporan laba rugi\n• 🧾 Baca & analisis nota belanja\n• 📈 Hitung HPP & margin keuntungan\n\nSilakan ajukan pertanyaan bisnis kamu! 🚀`,
+                answer: `🤖 Kazeer AI\n\nHalo! Saya adalah Kazeer, bot AI Business Consultant kamu untuk ${storeName}.\n\n💡 Saya bisa membantu kamu dengan:\n1. 📊 Analisis omzet & transaksi\n2. 🏆 Menu terlaris & performa penjualan\n3. 📦 Stok & bahan baku\n4. 💰 Laporan laba rugi\n5. 🧾 Baca & analisis nota belanja\n6. 📈 Hitung HPP & margin keuntungan\n\nSilakan ajukan pertanyaan bisnis kamu! 🚀`,
                 sql: null,
                 rawData: []
             });
@@ -380,7 +393,7 @@ app.post('/api/chat', async (req, res) => {
             if (items.length === 0) {
                 return res.json({
                     success: true,
-                    answer: "⚠️ Maaf, saya tidak berhasil membaca nota tersebut.\n\nCoba format seperti ini:\n```\nnota:\n- Kopi Arabika 500gr x 2 = Rp 90.000\n- Gula Pasir 1kg x 1 = Rp 15.000\n```",
+                    answer: "⚠️ Maaf, saya tidak berhasil membaca nota tersebut.\n\nCoba format seperti ini:\n\nnota:\n1. Kopi Arabika 500gr x 2 = Rp 90.000\n2. Gula Pasir 1kg x 1 = Rp 15.000",
                     sql: null,
                     rawData: []
                 });
@@ -388,7 +401,6 @@ app.post('/api/chat', async (req, res) => {
 
             const totalNota = items.reduce((sum, i) => sum + (i.subtotal || 0), 0);
 
-            // Kirim ke AI untuk analisis
             const notaPrompt = `
 WAJIB: Seluruh jawaban dalam Bahasa Indonesia. DILARANG menggunakan Bahasa Inggris.
 
@@ -407,11 +419,12 @@ Tugas kamu:
 4. Berikan 1-2 insight bisnis singkat (apakah pengeluaran ini wajar? ada yang perlu diperhatikan?)
 5. Tanyakan apakah owner ingin mencatat pengeluaran ini ke cash_logs
 
-Format jawaban: gunakan paragraf pendek, emoji yang relevan, dan poin-poin singkat.
-Gunakan bahasa Indonesia yang profesional namun ramah — bukan formal kaku.
+Format jawaban: gunakan paragraf pendek, emoji yang relevan, dan poin-poin singkat (Gunakan angka 1, 2, 3, BUKAN bullet).
+WAJIB berikan jarak baris ganda (enter) antar paragraf/poin.
+DILARANG menggunakan markdown bold/tanda bintang (*).
 JANGAN tampilkan JSON mentah.`;
 
-            const notaAnswer = await callNemotron(notaPrompt, true);
+            const notaAnswer = await callAI(notaPrompt, true);
             updateSession(phone, message, notaAnswer);
 
             return res.json({
@@ -426,13 +439,9 @@ JANGAN tampilkan JSON mentah.`;
         // ══════════════════════════════════════════════════════
         // 📈 FLOW: HPP & MARGIN CALCULATOR
         // ══════════════════════════════════════════════════════
-// ══════════════════════════════════════════════════════
-        // 📈 FLOW: HPP & MARGIN CALCULATOR
-        // ══════════════════════════════════════════════════════
         if (isHPPQuestion(message)) {
             console.log("   [📈 HPP question terdeteksi — thinking mode ON...]");
 
-            // Tarik SEMUA data resep dan biarkan Kazeer AI yang mencari menu mana yang relevan
             const hppData = await hitungHPP(storeId);
 
             const hppPrompt = `
@@ -441,33 +450,28 @@ WAJIB: Seluruh jawaban dalam Bahasa Indonesia. DILARANG menggunakan Bahasa Inggr
 Kamu adalah Kazeer, bot AI Business Consultant untuk ${storeName}.
 Pertanyaan owner: "${message}"
 
-Berikut data NYATA dari database — resep menu beserta referensi harga bahan dari catatan pembelian (cash_logs):
+Berikut data resep dan referensi harga bahan dari database:
 ${JSON.stringify(hppData, null, 2)}
 
 CARA MENGHITUNG HPP:
-Untuk setiap bahan dalam menu:
-- Jika "referensi_harga_dari_cashlog" tersedia → gunakan total_bayar dari sana sebagai referensi harga beli
-- Jika "referensi_harga_dari_cashlog" = null → JANGAN mengarang harga. Tulis: "harga [nama bahan] tidak ditemukan di catatan pembelian"
-- HPP per bahan = (qty_used / total_qty_beli) × total_bayar — estimasikan berdasarkan proporsi qty_used
+- Jika "referensi_harga_dari_cashlog" tersedia → gunakan total_bayar dari sana untuk mencari harga satuan.
+- HPP per bahan = (qty_used / total_qty_beli) × total_bayar.
 
-TUGAS (gunakan data di atas, JANGAN berasumsi di luar data):
-1. 🧮 Hitung HPP per menu berdasarkan data referensi harga yang tersedia
-2. 💰 Hitung margin kotor: ((harga_jual - HPP) / harga_jual) × 100%
-3. 📊 Kategorikan: Rendah < 30%, Sedang 30–60%, Tinggi > 60%
-4. 🏆 Sebutkan menu paling menguntungkan berdasarkan data
-5. ⚠️ Flagging menu margin rendah atau bahan yang harganya tidak tercatat
-6. 💡 Berikan 2–3 rekomendasi bisnis yang spesifik dan actionable
+TUGAS UTAMA:
+1. FOKUS HANYA PADA MENU YANG DITANYAKAN USER. Abaikan data menu lain yang tidak relevan dengan pertanyaan!
+2. 🧮 Tampilkan rincian perhitungan modal (HPP) per bahan baku khusus untuk menu tersebut.
+3. 💰 Hitung margin kotornya menggunakan harga jual yang baru (jika user memberikan harga baru di pertanyaan). Rumus: ((Harga Jual - Total HPP) / Harga Jual) × 100%
+4. 📊 Berikan kesimpulan apakah persentase margin tersebut sehat (Rendah <30%, Sedang 30-60%, Tinggi >60%).
+5. 💡 Berikan 1 rekomendasi bisnis singkat terkait harga tersebut.
 
-ATURAN FORMAT (WAJIB DIIKUTI):
-- DILARANG menggunakan tanda bintang (*) atau markdown bold (**teks**) dalam jawaban
-- DILARANG menggunakan bullet • — gunakan angka (1. 2. 3.) atau baris baru saja
-- Setiap poin diawali emoji, diikuti teks langsung tanpa tanda baca dekoratif
-- Pisahkan setiap poin dengan satu baris kosong
-- Format Rupiah: Rp 15.000 | Persentase: 45,5%
-- Jika ada bahan tanpa referensi harga, sebutkan dengan jelas di output
-- Jangan tampilkan JSON mentah`;
+ATURAN FORMAT (SANGAT PENTING - WAJIB DIIKUTI):
+- JAWABAN HARUS RAPI! WAJIB berikan ENTER (baris kosong ganda / line break) di antara setiap poin/paragraf. DILARANG menggabungkan jawaban menjadi satu paragraf panjang.
+- DILARANG menggunakan tanda bintang (*) atau format bold (teks tebal) dalam jawaban.
+- DILARANG menggunakan bullet • — gunakan angka (1. 2. 3.) atau susun ke bawah dengan rapi.
+- Format uang wajib pakai Rupiah (Rp 15.000).
+- JANGAN tampilkan teks JSON mentah.`;
 
-            const hppAnswer = await callNemotron(hppPrompt, true); // thinking ON
+            const hppAnswer = await callAI(hppPrompt, true); 
             updateSession(phone, message, hppAnswer);
 
             return res.json({
@@ -601,7 +605,7 @@ FORMAT OUTPUT
 
         console.log("   [⏳ Step A: Generating SQL...]");
         const promptToSQL = `${SYSTEM_PROMPT}\n\nPertanyaan: "${message}"\nQuery SQL:`;
-        let sqlQuery = await callNemotron(promptToSQL, false);
+        let sqlQuery = await callAI(promptToSQL, false);
         sqlQuery = sqlQuery.replace(/```sql/ig, '').replace(/```/g, '').trim();
 
         validateSQL(sqlQuery, storeId);
@@ -649,24 +653,23 @@ Data dari database: ${dataToAI}${dataRangeContext}
 Riwayat percakapan:
 ${conversationHistory || '(Tidak ada riwayat)'}
 
-CARA MENJAWAB:
+CARA MENJAWAB (WAJIB DIIKUTI):
 1. Setiap poin diawali emoji yang relevan, diikuti teks langsung
-2. Pisahkan setiap poin dengan satu baris kosong agar mudah dibaca
+2. JAWABAN HARUS RAPI! WAJIB berikan ENTER (baris kosong ganda / line break) di antara setiap poin/paragraf.
 3. Maksimal 2-3 kalimat per poin — jangan wall of text
 4. Selalu akhiri dengan 1 insight bisnis yang actionable dan spesifik
 5. Bahasa Indonesia yang profesional tapi tetap ramah
 6. Format Rupiah: Rp 1.250.000 | Persentase: 23,5%
 7. Untuk daftar atau ranking: gunakan angka (1. 2. 3.) bukan bullet
 8. Jika data kosong: jelaskan dengan sopan + sebutkan rentang data yang tersedia
-9. Jika ada persentase naik/turun: jelaskan artinya dalam konteks bisnis
-10. Jika pertanyaan adalah follow-up: jawab mengacu konteks sebelumnya
 
 DILARANG KERAS:
-- Menggunakan tanda bintang (*) atau markdown bold (**teks**) dalam jawaban
-- Menampilkan JSON, kode teknis, atau simbol programming
-- Mengarang angka yang tidak ada di data`;
+- DILARANG menggunakan tanda bintang (*) atau markdown bold dalam jawaban.
+- DILARANG menggunakan bullet • — gunakan angka (1. 2. 3.).
+- Menampilkan JSON, kode teknis, atau simbol programming.
+- Mengarang angka yang tidak ada di data.`;
 
-        const finalAnswer = await callNemotron(promptToSummary, true);
+        const finalAnswer = await callAI(promptToSummary, true);
         updateSession(phone, message, finalAnswer);
 
         console.log("   [✅ Done]");
@@ -725,13 +728,13 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, '0.0.0.0', () => {
     console.log(`
 ╔════════════════════════════════════════╗
-║        🤖 KAZEER AI v2.0.0            ║
-║        Business Consultant Bot        ║
+║        🤖 KAZEER AI v2.0.0             ║
+║        Business Consultant Bot         ║
 ╠════════════════════════════════════════╣
 ║  🔗 Port    : ${PORT}                    ║
-║  👥 Mode    : Multi-Tenant            ║
-║  🧠 Engine  : NVIDIA Nemotron         ║
-║  📦 Features: SQL · Nota · HPP       ║
+║  👥 Mode    : Multi-Tenant             ║
+║  🧠 Engine  : Llama 4 Maverick (Fetch) ║
+║  📦 Features: SQL · Nota · HPP         ║
 ╚════════════════════════════════════════╝
     `);
 });
