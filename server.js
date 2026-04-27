@@ -630,9 +630,8 @@ FORMAT OUTPUT
             }
         }
 
-        // 🧠 STEP C: KAZEER ANSWER GENERATOR
-        console.log("   [⏳ Step C: Kazeer menyusun jawaban...]");
-        const promptToSummary = `
+       console.log("   [⏳ Step C: Kazeer menyusun jawaban...]");
+       const promptToSummary = `
 WAJIB: Seluruh jawaban dalam Bahasa Indonesia. DILARANG menggunakan Bahasa Inggris dalam jawaban akhir.
 
 Kamu adalah Kazeer, bot AI Business Consultant untuk ${storeName}.
@@ -640,19 +639,28 @@ Kamu adalah Kazeer, bot AI Business Consultant untuk ${storeName}.
 Pertanyaan Owner: "${message}"
 Data dari database: ${dataToAI}${dataRangeContext}
 
-CARA MENJAWAB (WAJIB DIIKUTI):
-1. Setiap poin diawali emoji yang relevan, diikuti teks langsung
-2. JAWABAN HARUS RAPI! WAJIB berikan ENTER (baris kosong ganda / line break) di antara setiap poin/paragraf.
-3. [PENTING] JIKA MENDAPATKAN RINCIAN PENGELUARAN (description & amount): Kamu wajib menjumlahkannya sendiri secara matematis dan tampilkan TOTAL keseluruhannya. Lalu, berikan juga breakdown/rinciannya dari mana uang tersebut terpakai agar owner tahu detailnya.
-4. Selalu akhiri dengan 1 insight bisnis yang actionable dan spesifik
-5. Bahasa Indonesia yang profesional tapi santai. Gunakan sebutan "Owner" atau "Pemilik" untuk menyapa user. DILARANG menggunakan kata "Bos".
-6. Format Rupiah: Rp 1.250.000
-7. Untuk daftar: gunakan angka (1. 2. 3.) bukan bullet.
+ATURAN FORMAT JAWABAN (SANGAT PENTING - WAJIB DIIKUTI):
+Kamu WAJIB memisahkan setiap bagian dengan baris kosong ganda (ENTER). DILARANG KERAS menggabungkan semua kalimat menjadi satu paragraf panjang!
 
-DILARANG KERAS:
-- DILARANG menggunakan tanda bintang (*) atau markdown bold dalam jawaban.
-- DILARANG menggunakan bullet •.
-- DILARANG Menampilkan JSON mentah.`;
+Gunakan struktur persis seperti ini (harus ada spasi kosong antar bagian):
+
+[Emoji] [Kalimat Pembuka/Sapaan ke Owner]
+
+[Emoji] [Kalimat Pengantar Rincian]
+1. [Rincian 1]
+2. [Rincian 2]
+
+[Emoji] Total Keseluruhan: Rp [X]
+
+💡 Insight Bisnis: [Saran spesifik dan actionable dari kamu]
+
+ATURAN TAMBAHAN:
+1. [PENTING] JIKA MENDAPATKAN RINCIAN PENGELUARAN (description & amount): Kamu wajib menjumlahkannya sendiri secara matematis dan tampilkan TOTAL keseluruhannya sesuai template di atas.
+2. Gunakan sebutan "Owner" atau "Pemilik". DILARANG menggunakan kata "Bos".
+3. Format Rupiah: Rp 1.250.000 (tanpa desimal .00)
+4. Untuk daftar: HANYA gunakan angka (1. 2. 3.) BUKAN bullet.
+5. DILARANG KERAS menggunakan tanda bintang (*) atau markdown bold dalam jawaban.
+6. DILARANG Menampilkan JSON mentah.`;
 
         const finalAnswer = await callAI(promptToSummary, true);
         updateSession(phone, message, finalAnswer);
