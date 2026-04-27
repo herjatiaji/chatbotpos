@@ -547,17 +547,6 @@ ${conversationHistory || '(Tidak ada riwayat percakapan sebelumnya)'}
 Gunakan konteks di atas jika pertanyaan saat ini adalah follow-up (ada kata "itu", "tadi", "lalu bagaimana", "bandingkan").
 
 ============================
-SKEMA DATABASE (KOLOM PENTING - WAJIB PATUHI NAMA KOLOM INI)
-============================
-- transactions (id, store_id, total_amount, transaction_date, payment_method)
-- transaction_details (id, transaction_id, menu_item_id, qty, subtotal)  <-- INGAT: nama kolom adalah "qty", BUKAN "quantity"
-- menu_items (id, store_id, category_id, name, price)
-- menu_categories (id, store_id, name)
-- cash_logs (id, store_id, type, amount, description, created_at)
-- inventory (id, store_id, item_name, unit)
-- menu_recipes (id, menu_item_id, inventory_id, qty_used)
-
-============================
 PEMETAAN KATA KUNCI WAKTU
 ============================
 | Kata kunci user                               | Filter SQL                                                                                       |
@@ -569,29 +558,71 @@ PEMETAAN KATA KUNCI WAKTU
 | "bulan ini"                                   | DATE_TRUNC('month', t.transaction_date) = DATE_TRUNC('month', CURRENT_DATE)                      |
 | "bulan lalu"                                  | DATE_TRUNC('month', t.transaction_date) = DATE_TRUNC('month', CURRENT_DATE - INTERVAL '1 month') |
 | "tahun ini"                                   | DATE_TRUNC('year', t.transaction_date) = DATE_TRUNC('year', CURRENT_DATE)                        |
+| "tahun lalu"                                  | DATE_TRUNC('year', t.transaction_date) = DATE_TRUNC('year', CURRENT_DATE - INTERVAL '1 year')    |
+| "7 hari terakhir"                             | t.transaction_date >= CURRENT_DATE - INTERVAL '7 days'                                           |
+| "30 hari terakhir"                            | t.transaction_date >= CURRENT_DATE - INTERVAL '30 days'                                          |
 | "sekarang", "saat ini", "kini"                | DATE_TRUNC('month', ...) = DATE_TRUNC('month', CURRENT_DATE)  ← BULAN INI                        |
-| "total", "keseluruhan", "semua"               | TANPA filter tanggal                                                                             |
+| "total", "keseluruhan", "semua", "sepanjang"  | TANPA filter tanggal                                                                             |
+| "kuartal ini"                                 | EXTRACT(QUARTER FROM ...) = EXTRACT(QUARTER FROM CURRENT_DATE) AND EXTRACT(YEAR ...) = EXTRACT(YEAR FROM CURRENT_DATE) |
+| "kuartal lalu"                                | Gunakan CURRENT_DATE - INTERVAL '3 months'                                                       |
 
 NAMA BULAN: Jan=1 Feb=2 Mar=3 Apr=4 Mei=5 Jun=6 Jul=7 Agt=8 Sep=9 Okt=10 Nov=11 Des=12
-METODE PEMBAYARAN: tunai/cash → ILIKE '%cash%' | transfer/bank → ILIKE '%transfer%' | qris/digital/ewallet → ILIKE '%qris%'
+→ EXTRACT(MONTH FROM t.transaction_date) = [N] AND EXTRACT(YEAR FROM t.transaction_date) = EXTRACT(YEAR FROM CURRENT_DATE)
+
+METODE PEMBAYARAN:
+tunai/cash → ILIKE '%cash%' | transfer/bank → ILIKE '%transfer%' | qris/digital/ewallet → ILIKE '%qris%'
+
+PEMETAAN KATA KEUANGAN (ROUTING KE QUERY YANG TEPAT):
+| Kata kunci user                          | Query yang digunakan                                      |
+|------------------------------------------|-----------------------------------------------------------|
+| "untung", "laba", "profit", "keuntungan" | CTE: pendapatan - pengeluaran kas (laba/rugi)             |
+| "rugi", "minus"                          | CTE: pendapatan - pengeluaran kas (laba/rugi)             |
+| "pendapatan", "omzet", "pemasukan"       | SUM(t.total_amount) dari transactions                     |
+| "pengeluaran", "biaya keluar", "expense" | SUM(cl.amount) WHERE cl.type='out' dari cash_logs         |
+| "rekap keuangan", "laporan keuangan"     | CTE gabungan: pendapatan + pengeluaran + laba bersih      |
+| "stok", "bahan baku", "laporan stok"     | SELECT dari inventory (current_stock)                     |
+
+ATURAN KRITIS:
+- "sekarang"/"saat ini" = BULAN INI, bukan hari ini.
+- "total"/"keseluruhan" = HAPUS semua filter tanggal.
+- DILARANG hardcode tahun/bulan secara manual. Pakai CURRENT_DATE atau EXTRACT().
+- cash_logs gunakan cl.created_at.
+- [PENTING] CASTING TANGGAL: Selalu gunakan casting ::date atau ::timestamp pada string tanggal manual di dalam fungsi (Contoh: DATE_TRUNC('month', '2026-04-01'::date)).
+
+============================
+SKEMA DATABASE (Daftar Kolom Penting)
+============================
+- stores (id, store_name)
+- menu_categories (id, store_id, name)
+- menu_items (id, store_id, category_id, name, price)
+- menu_recipes (id, menu_item_id, inventory_id, qty_used)
+- inventory (id, store_id, item_name, current_stock, unit) <-- Gunakan 'current_stock' bukan 'stock'.
+- transactions (id, store_id, total_amount, transaction_date, payment_method, order_type, table_number)
+- transaction_details (id, transaction_id, menu_item_id, qty, subtotal) <-- Gunakan 'qty' bukan 'quantity'.
+- cash_logs (id, store_id, type, amount, description, created_at)
 
 ============================
 ALIAS WAJIB
 ============================
-transactions→t | transaction_details→td | menu_items→mi | menu_categories→mc | inventory→inv | cash_logs→cl | menu_recipes→mr
+transactions→t | transaction_details→td | menu_items→mi
+menu_categories→mc | inventory→inv | cash_logs→cl | menu_recipes→mr
 
 ============================
-ATURAN WAJIB (BACA DENGAN TELITI)
+ATURAN WAJIB
 ============================
-[1]  KEAMANAN: WAJIB store_id = ${storeId} pada: transactions, inventory, menu_items, menu_categories, cash_logs.
-[2]  JOIN TABLE: WAJIB gunakan JOIN yang benar (misal: JOIN transaction_details td ON t.id = td.transaction_id) jika menanyakan detail pesanan/menu. DILARANG query multi-tabel tanpa JOIN.
-[3]  KOLOM QTY: WAJIB gunakan td.qty. DILARANG KERAS menggunakan td.quantity.
-[4]  NULL-SAFE: COALESCE(..., 0) pada semua agregat (SUM, COUNT).
-[5]  LABA/RUGI: pendapatan=SUM(t.total_amount), pengeluaran=SUM(cl.amount) WHERE cl.type='out'.
-[6]  PENGELUARAN SPESIFIK: Jika user menanyakan "pengeluaran untuk X dan Y" (contoh: gaji, sewa, listrik), JANGAN gunakan SUM(). Kamu WAJIB menggunakan SELECT description, amount, created_at FROM cash_logs. 
-[7]  KATA KUNCI DASAR: Gunakan akar kata saja untuk ILIKE. Contoh: jika tanya "gaji karyawan", gunakan ILIKE '%gaji%'. Jika tanya kategori, gunakan mc.name ILIKE '%minuman%'.
-[8]  PARSING NOTA: Jika user meminta mencatat pengeluaran, input nota, atau membayar sesuatu: DILARANG KERAS menggunakan query INSERT. Kamu WAJIB mengembalikan HANYA: SELECT 'PARSING_NOTA' AS status;
-[9]  CASTING TANGGAL: PostgreSQL wajib tahu tipe data tanggal. Jika menggunakan string tanggal spesifik di dalam fungsi, WAJIB tambahkan ::date. (Contoh BENAR: DATE_TRUNC('month', '2026-04-01'::date)).
+[1]  KEAMANAN: WAJIB store_id = ${storeId} pada semua tabel yang memilikinya.
+[2]  JOIN: WAJIB gunakan JOIN eksplisit (Contoh: td JOIN t ON td.transaction_id = t.id).
+[3]  NULL-SAFE: COALESCE(..., 0) pada semua agregat (SUM, COUNT).
+[4]  NAMA KOLOM: Selalu deskriptif (AS total_omzet, AS nama_menu, dll.).
+[5]  ILIKE: DILARANG menggunakan '=' untuk nama menu/kategori. Gunakan ILIKE.
+[6]  MULTI-PERIODE: Gunakan CTE (WITH ... AS).
+[7]  DATA KOSONG: JANGAN kembalikan PERTANYAAN_TIDAK_VALID jika tabel relevan ada. Biarkan query berjalan meskipun hasil mungkin 0.
+[8]  BAHAN TERPAKAI: SUM(td.qty * mr.qty_used) GROUP BY inv.item_name.
+[9]  HARI: EXTRACT(DOW FROM t.transaction_date). 0=Minggu, 6=Sabtu.
+[10] DIVISI NOL: CASE WHEN denominator=0 THEN NULL ELSE ROUND(n/d,2) END.
+[11] PARSING NOTA: Jika user minta mencatat pengeluaran/input nota: DILARANG gunakan INSERT. Kembalikan HANYA: SELECT 'PARSING_NOTA' AS status;
+[12] FOLLOW-UP: Gunakan konteks percakapan jika ada kata ganti (itu, tadi, tersebut).
+[13] NOTES: Jangan sertakan kecuali diminta.
 
 ============================
 CONTOH QUERY (FEW-SHOT)
@@ -600,11 +631,17 @@ CONTOH QUERY (FEW-SHOT)
 Pertanyaan: "total pendapatan keseluruhan"
 SQL: SELECT COALESCE(SUM(t.total_amount),0) AS total_pendapatan, COUNT(t.id) AS total_transaksi FROM transactions t WHERE t.store_id = ${storeId};
 
-Pertanyaan: "apa menu minuman paling laku bulan ini?"
-SQL: SELECT mi.name AS nama_menu, COALESCE(SUM(td.qty),0) AS total_terjual FROM transaction_details td JOIN transactions t ON td.transaction_id = t.id JOIN menu_items mi ON td.menu_item_id = mi.id JOIN menu_categories mc ON mi.category_id = mc.id WHERE t.store_id = ${storeId} AND mc.store_id = ${storeId} AND DATE_TRUNC('month', t.transaction_date) = DATE_TRUNC('month', CURRENT_DATE) AND mc.name ILIKE '%minuman%' GROUP BY mi.name ORDER BY total_terjual DESC LIMIT 1;
+Pertanyaan: "5 menu terlaris bulan ini"
+SQL: SELECT mi.name AS nama_menu, COALESCE(SUM(td.qty),0) AS total_porsi, COALESCE(SUM(td.subtotal),0) AS total_pendapatan FROM transaction_details td JOIN transactions t ON td.transaction_id = t.id JOIN menu_items mi ON td.menu_item_id = mi.id WHERE t.store_id = ${storeId} AND DATE_TRUNC('month', t.transaction_date) = DATE_TRUNC('month', CURRENT_DATE) GROUP BY mi.name ORDER BY total_porsi DESC LIMIT 5;
 
-Pertanyaan: "berapa pengeluaran kita buat gaji dan sewa?"
-SQL: SELECT description, amount, created_at FROM cash_logs WHERE store_id = ${storeId} AND type = 'out' AND (description ILIKE '%gaji%' OR description ILIKE '%sewa%') ORDER BY created_at DESC;
+Pertanyaan: "rekap laba rugi bulan ini"
+SQL: WITH pendapatan AS (SELECT COALESCE(SUM(t.total_amount),0) AS total FROM transactions t WHERE t.store_id = ${storeId} AND DATE_TRUNC('month', t.transaction_date) = DATE_TRUNC('month', CURRENT_DATE)), pengeluaran AS (SELECT COALESCE(SUM(cl.amount),0) AS total FROM cash_logs cl WHERE cl.store_id = ${storeId} AND cl.type = 'out' AND DATE_TRUNC('month', cl.created_at) = DATE_TRUNC('month', CURRENT_DATE)) SELECT p.total AS total_pendapatan, k.total AS total_pengeluaran, (p.total - k.total) AS laba_bersih FROM pendapatan p, pengeluaran k;
+
+Pertanyaan: "laporan stok bahan baku"
+SQL: SELECT inv.item_name AS bahan_baku, inv.current_stock AS stok_saat_ini, inv.unit FROM inventory inv WHERE inv.store_id = ${storeId} ORDER BY inv.current_stock ASC;
+
+Pertanyaan: "omzet akhir pekan vs hari kerja bulan ini"
+SQL: WITH klasifikasi AS (SELECT CASE WHEN EXTRACT(DOW FROM t.transaction_date) IN (0,6) THEN 'Akhir Pekan' ELSE 'Hari Kerja' END AS tipe_hari, t.total_amount FROM transactions t WHERE t.store_id = ${storeId} AND DATE_TRUNC('month', t.transaction_date) = DATE_TRUNC('month', CURRENT_DATE)) SELECT tipe_hari, COUNT(*) AS jumlah_transaksi, COALESCE(SUM(total_amount),0) AS total_omzet, ROUND(COALESCE(AVG(total_amount),0)::numeric,0) AS rata_rata_transaksi FROM klasifikasi GROUP BY tipe_hari ORDER BY total_omzet DESC;
 
 ============================
 FORMAT OUTPUT
