@@ -3,12 +3,21 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import 'dotenv/config';
 import sql from './db.js';
+import OpenAI from 'openai';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
 
 app.use(express.json());
 app.use(express.static('public'));
+
+// ==========================================
+// KONFIGURASI NVIDIA NIM
+// ==========================================
+const openai = new OpenAI({
+    apiKey: process.env.NVIDIA_API_KEY,
+    baseURL: 'https://integrate.api.nvidia.com/v1',
+});
 
 // ==========================================
 // MULTI-TENANT: Rate limiter per store
@@ -34,10 +43,10 @@ const SESSION_TTL = 30 * 60 * 1000;
 
 function getSession(phone) {
     const session = sessionStore.get(phone);
-    if (!session) return { history: [], lastActive: Date.now(), pendingNota: null };
+    if (!session) return { history: [], lastActive: Date.now() };
     if (Date.now() - session.lastActive > SESSION_TTL) {
         sessionStore.delete(phone);
-        return { history: [], lastActive: Date.now(), pendingNota: null };
+        return { history: [], lastActive: Date.now() };
     }
     return session;
 }
@@ -76,89 +85,57 @@ function validateSQL(sqlQuery, storeId) {
     if (!/^\s*(?:WITH\s+\w|SELECT\s)/i.test(sqlQuery)) {
         throw new Error('SQL tidak aman: hanya SELECT atau CTE yang diizinkan.');
     }
-    const isFallback = sqlQuery.includes('PERTANYAAN_TIDAK_VALID') || sqlQuery.includes('PARSING_NOTA');
     const storeIdPattern = new RegExp(`store_id\\s*=\\s*${storeId}(?!\\d)`);
-    if (!storeIdPattern.test(sqlQuery) && !isFallback) {
+    if (!storeIdPattern.test(sqlQuery)) {
         throw new Error(`SQL tidak aman: tidak ada filter store_id = ${storeId}.`);
     }
 }
 
 // ==========================================
-// 🔥 AI ENGINE (Llama 4 Maverick via NATIVE FETCH)
+// AI ENGINE
 // ==========================================
-async function callAI(promptText, enableThinking = false, retries = 3, delay = 5000) {
+async function callNemotron(promptText, enableThinking = false, retries = 3, delay = 5000) {
     if (!process.env.NVIDIA_API_KEY) throw new Error('NVIDIA_API_KEY kosong!');
-
-    const invokeUrl = "https://integrate.api.nvidia.com/v1/chat/completions";
-    const headers = {
-        "Authorization": `Bearer ${process.env.NVIDIA_API_KEY}`,
-        "Accept": "text/event-stream",
-        "Content-Type": "application/json"
-    };
-
-    const payload = {
-        "model": "meta/llama-4-maverick-17b-128e-instruct",
-        "messages": [{"role": "user", "content": promptText}],
-        "max_tokens": 4096,
-        "temperature": enableThinking ? 0.6 : 0.1,
-        "top_p": 0.95,
-        "stream": true
-    };
 
     for (let i = 0; i < retries; i++) {
         try {
-            const response = await fetch(invokeUrl, {
-                method: 'POST',
-                headers: headers,
-                body: JSON.stringify(payload)
+            const stream = await openai.chat.completions.create({
+                model: 'nvidia/nemotron-3-super-120b-a12b',
+                messages: [{ role: 'user', content: promptText }],
+                temperature: enableThinking ? 1 : 0.1,
+                top_p: 0.95,
+                max_tokens: enableThinking ? 4096 : 2048,
+                reasoning_budget: enableThinking ? 4096 : 0,
+                chat_template_kwargs: { enable_thinking: enableThinking },
+                stream: true,
             });
 
-            if (!response.ok) {
-                const isOverload = response.status === 503 || response.status === 429;
-                if (i === retries - 1 || !isOverload) {
-                    throw new Error(`HTTP error! status: ${response.status}`);
-                }
-                await new Promise(res => setTimeout(res, delay));
-                delay *= 2;
-                continue;
-            }
-
-            const reader = response.body.getReader();
-            const decoder = new TextDecoder('utf-8');
             let fullContent = '';
-            let buffer = '';
-
-            while (true) {
-                const { done, value } = await reader.read();
-                if (done) break;
-
-                buffer += decoder.decode(value, { stream: true });
-                const lines = buffer.split('\n');
-                
-                buffer = lines.pop();
-
-                for (const line of lines) {
-                    if (line.startsWith('data: ')) {
-                        const dataStr = line.substring(6).trim();
-                        if (dataStr === '[DONE]') continue;
-
-                        try {
-                            const parsed = JSON.parse(dataStr);
-                            if (parsed.choices && parsed.choices[0] && parsed.choices[0].delta && parsed.choices[0].delta.content) {
-                                fullContent += parsed.choices[0].delta.content;
-                            }
-                        } catch (e) {
-                            // Abaikan error parsing JSON stream yang terpotong
-                        }
-                    }
+            let reasoningBuffer = '';
+            for await (const chunk of stream) {
+                const delta = chunk.choices[0]?.delta;
+                // Skip reasoning_content — hanya ambil content final
+                if (delta?.reasoning_content) {
+                    reasoningBuffer += delta.reasoning_content;
+                }
+                if (delta?.content) {
+                    fullContent += delta.content;
                 }
             }
-
-            return fullContent.trim();
+            // Bersihkan sisa thinking yang bocor ke content (pola bahasa Inggris di awal)
+            let cleaned = fullContent.trim();
+            // Hapus blok <think>...</think> jika ada
+            cleaned = cleaned.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
+            // Hapus baris-baris awal yang seluruhnya bahasa Inggris (reasoning bocor)
+            const lines = cleaned.split('\n');
+            const firstIdLines = lines.findIndex(l => /[a-zA-Z]{4,}/.test(l) === false || /[\u00C0-\u024F\u1E00-\u1EFF]/.test(l) || /^[^a-zA-Z]*$/.test(l));
+            return cleaned;
 
         } catch (error) {
             console.log(`   [⚠️ API Error] Percobaan ${i + 1}/${retries}: ${error.message}`);
-            if (i === retries - 1) throw new Error('Gagal menghubungi server AI.');
+            const isOverload = error.status === 503 || error.status === 429 ||
+                               error.message?.includes('503') || error.message?.includes('429');
+            if (i === retries - 1 || !isOverload) throw new Error('Gagal menghubungi server AI.');
             await new Promise(res => setTimeout(res, delay));
             delay *= 2;
         }
@@ -195,14 +172,23 @@ function isChitchat(message) {
 
 // ==========================================
 // HELPER: Deteksi apakah pesan adalah nota/struk
+// Format yang didukung:
+// - "nota: item1 x qty harga, item2 x qty harga"
+// - Teks bebas berisi daftar item & harga
 // ==========================================
 function isNota(message) {
-    const msg = message.toLowerCase();
-    if (msg.includes('nota') || msg.includes('struk') || msg.includes('catat')) return true;
-    if ((msg.includes('beli') || msg.includes('bayar')) && /\d/.test(msg)) return true;
-    
-    const notaPatterns = [/\d+\s*[xX]\s*\d+/, /rp\.?\s*\d{3,}/i];
-    return notaPatterns.some(p => p.test(msg));
+    const notaPatterns = [
+        /nota[:\s]/i,
+        /struk[:\s]/i,
+        /receipt[:\s]/i,
+        /baca\s+nota/i,
+        /input\s+nota/i,
+        /catat\s+nota/i,
+        // Deteksi pola item x qty = harga
+        /\d+\s*[xX]\s*\d+/,
+        /rp\.?\s*\d{3,}/i,
+    ];
+    return notaPatterns.some(p => p.test(message.trim()));
 }
 
 // ==========================================
@@ -237,7 +223,7 @@ ${notaText}
 
 JSON:`;
 
-    const result = await callAI(prompt, false);
+    const result = await callNemotron(prompt, false);
     try {
         const cleaned = result.replace(/```json/ig, '').replace(/```/g, '').trim();
         return JSON.parse(cleaned);
@@ -265,17 +251,23 @@ function isHPPQuestion(message) {
 }
 
 // ==========================================
-// HPP CALCULATOR
+// HPP CALCULATOR: Ambil semua data relevan dari DB
+// Serahkan ke AI untuk reasoning — jangan filter di SQL
+// karena deskripsi cash_logs sering generik
 // ==========================================
 async function hitungHPP(storeId, menuKeyword = null) {
-    const menuFilter = menuKeyword ? `AND mi.name ILIKE '%${menuKeyword}%'` : '';
+    const menuFilter = menuKeyword
+        ? `AND mi.name ILIKE '%${menuKeyword}%'`
+        : '';
+
+    // Query 1: Data resep lengkap per menu
     const resepData = await sql.unsafe(`
         SELECT
-            mi.id       AS menu_id,
             mi.name     AS nama_menu,
             mi.price    AS harga_jual,
-            inv.item_name AS bahan,
+            inv.item_name AS nama_bahan,
             inv.unit,
+            inv.current_stock,
             mr.qty_used
         FROM menu_items mi
         JOIN menu_recipes mr ON mr.menu_item_id = mi.id
@@ -285,20 +277,21 @@ async function hitungHPP(storeId, menuKeyword = null) {
         ORDER BY mi.name, inv.item_name
     `);
 
-    const hargaRef = await sql.unsafe(`
+    // Query 2: SEMUA pengeluaran kas (type=out) — tanpa filter nama bahan
+    // Biarkan AI yang reasoning mana yang relevan
+    const allCashOut = await sql.unsafe(`
         SELECT
-            inv.item_name,
-            inv.unit,
             cl.amount       AS total_bayar,
             cl.description  AS keterangan,
-            cl.created_at   AS tanggal_beli
+            cl.created_at::date AS tanggal
         FROM cash_logs cl
-        JOIN inventory inv ON cl.description ILIKE '%' || inv.item_name || '%'
         WHERE cl.store_id = ${storeId}
         AND cl.type = 'out'
         ORDER BY cl.created_at DESC
+        LIMIT 50
     `);
 
+    // Susun per menu
     const menuMap = {};
     for (const row of resepData) {
         if (!menuMap[row.nama_menu]) {
@@ -308,22 +301,24 @@ async function hitungHPP(storeId, menuKeyword = null) {
                 bahan: []
             };
         }
-        const ref = hargaRef.filter(h => h.item_name === row.bahan);
         menuMap[row.nama_menu].bahan.push({
-            nama: row.bahan,
+            nama: row.nama_bahan,
             qty_used: Number(row.qty_used),
             unit: row.unit,
-            referensi_harga_dari_cashlog: ref.length > 0
-                ? ref.slice(0, 2).map(r => ({
-                    total_bayar: Number(r.total_bayar),
-                    keterangan: r.keterangan,
-                    tanggal: r.tanggal_beli
-                  }))
-                : null
+            stok_saat_ini: Number(row.current_stock)
         });
     }
 
-    return Object.values(menuMap);
+    return {
+        // Data resep per menu — terstruktur
+        menu: Object.values(menuMap),
+        // Semua catatan pengeluaran kas — AI yang matching ke bahan
+        catatan_pembelian_kas: allCashOut.map(r => ({
+            jumlah: Number(r.total_bayar),
+            keterangan: r.keterangan,
+            tanggal: r.tanggal
+        }))
+    };
 }
 
 // ==========================================
@@ -339,26 +334,18 @@ app.post('/api/chat', async (req, res) => {
     try {
         console.log(`\n💬 [${phone}] "${message}"`);
 
-       const userCheck = await sql`
+        const userCheck = await sql`
             SELECT u.owner_name, u.store_id, s.store_name 
             FROM whatsapp_users u 
             JOIN stores s ON u.store_id = s.id 
             WHERE u.phone_number = ${phone}
         `;
 
-        // 🔥 MODE DEMO: Bypas Pengecekan User 🔥
-        let activeUser;
         if (userCheck.length === 0) {
-            console.log(`   [Demo Mode] ID ${phone} tidak terdaftar. Otomatis masuk ke Store 1.`);
-            activeUser = {
-                owner_name: 'Demo Owner',
-                store_id: 1,
-                store_name: 'Bengkel Kopi'
-            };
-        } else {
-            activeUser = userCheck[0];
+            return res.status(403).json({ success: false, answer: "Mohon maaf, nomor Anda tidak terdaftar dalam sistem Kazeer AI." });
         }
 
+        const activeUser = userCheck[0];
         const storeId = activeUser.store_id;
         const storeName = activeUser.store_name;
 
@@ -374,48 +361,13 @@ app.post('/api/chat', async (req, res) => {
         if (isChitchat(message)) {
             return res.json({
                 success: true,
-                answer: `🤖 Kazeer AI\n\nHalo Owner! Saya adalah Kazeer, bot AI Business Consultant untuk ${storeName}.\n\n💡 Saya bisa membantu dengan:\n1. 📊 Analisis omzet & transaksi\n2. 🏆 Menu terlaris & performa penjualan\n3. 📦 Stok & bahan baku\n4. 💰 Laporan laba rugi\n5. 🧾 Baca & analisis nota belanja\n6. 📈 Hitung HPP & margin keuntungan\n\nSilakan ajukan pertanyaan bisnis Anda! 🚀`,
+                answer: `🤖 *Kazeer AI*\n\nHalo! Saya adalah Kazeer, bot AI Business Consultant kamu untuk ${storeName}.\n\n💡 Saya bisa membantu kamu dengan:\n• 📊 Analisis omzet & transaksi\n• 🏆 Menu terlaris & performa penjualan\n• 📦 Stok & bahan baku\n• 💰 Laporan laba rugi\n• 🧾 Baca & analisis nota belanja\n• 📈 Hitung HPP & margin keuntungan\n\nSilakan ajukan pertanyaan bisnis kamu! 🚀`,
                 sql: null,
                 rawData: []
             });
         }
 
         const session = getSession(phone);
-
-        // ══════════════════════════════════════════════════════
-        // ✅ FLOW: KONFIRMASI SIMPAN NOTA
-        // ══════════════════════════════════════════════════════
-        if (message.toLowerCase() === 'simpan' && session.pendingNota) {
-            console.log("   [📥 Menyimpan nota ke Database...]");
-            const { total, description } = session.pendingNota;
-
-            await sql`
-                INSERT INTO cash_logs (store_id, type, amount, description, created_at)
-                VALUES (${storeId}, 'out', ${total}, ${description}, NOW())
-            `;
-
-            session.pendingNota = null;
-            sessionStore.set(phone, session);
-
-            return res.json({
-                success: true,
-                answer: `✅ Siap Owner! Pengeluaran sebesar Rp ${total.toLocaleString('id-ID')} sudah berhasil dicatat ke laporan keuangan ${storeName}.\n\nAda lagi yang bisa Kazeer bantu? 🚀`,
-                sql: null,
-                rawData: []
-            });
-        }
-
-        if (message.toLowerCase() === 'batal' && session.pendingNota) {
-            session.pendingNota = null;
-            sessionStore.set(phone, session);
-            return res.json({ 
-                success: true, 
-                answer: "Oke Owner, pencatatan nota dibatalkan. 👌", 
-                sql: null, 
-                rawData: [] 
-            });
-        }
-
         const conversationHistory = session.history
             .map(h => `${h.role === 'user' ? 'Owner' : 'Kazeer'}: ${h.content}`)
             .join('\n');
@@ -430,27 +382,20 @@ app.post('/api/chat', async (req, res) => {
             if (items.length === 0) {
                 return res.json({
                     success: true,
-                    answer: "⚠️ Maaf Owner, Kazeer belum berhasil membaca detail itemnya. Boleh coba ketik dengan format yang lebih jelas?\n\nContoh:\nnota: beli sabun cuci 15rb",
+                    answer: "⚠️ Maaf, saya tidak berhasil membaca nota tersebut.\n\nCoba format seperti ini:\n```\nnota:\n- Kopi Arabika 500gr x 2 = Rp 90.000\n- Gula Pasir 1kg x 1 = Rp 15.000\n```",
                     sql: null,
                     rawData: []
                 });
             }
 
             const totalNota = items.reduce((sum, i) => sum + (i.subtotal || 0), 0);
-            const itemDescription = items.map(i => `${i.nama_item} (${i.qty})`).join(', ');
 
-            session.pendingNota = {
-                items: items,
-                total: totalNota,
-                description: `Belanja: ${itemDescription}`
-            };
-            sessionStore.set(phone, session);
-
+            // Kirim ke AI untuk analisis
             const notaPrompt = `
 WAJIB: Seluruh jawaban dalam Bahasa Indonesia. DILARANG menggunakan Bahasa Inggris.
 
 Kamu adalah Kazeer, bot AI Business Consultant yang profesional.
-Kamu baru saja membaca nota belanja dari Owner ${storeName}.
+Kamu baru saja membaca nota belanja dari ${storeName}.
 
 Data item yang berhasil diekstrak:
 ${JSON.stringify(items, null, 2)}
@@ -462,14 +407,13 @@ Tugas kamu:
 2. Tampilkan total belanja
 3. Kelompokkan per kategori (bahan_baku, operasional, dll)
 4. Berikan 1-2 insight bisnis singkat (apakah pengeluaran ini wajar? ada yang perlu diperhatikan?)
-5. TANYAKAN DENGAN JELAS: "Apakah data ini sudah benar, Owner? Balas SIMPAN untuk mencatat ke kas, atau BATAL."
+5. Tanyakan apakah owner ingin mencatat pengeluaran ini ke cash_logs
 
-Format jawaban: gunakan paragraf pendek, emoji yang relevan, dan poin-poin singkat (Gunakan angka 1, 2, 3, BUKAN bullet).
-WAJIB berikan jarak baris ganda (enter) antar paragraf/poin.
-DILARANG menggunakan markdown bold/tanda bintang (*).
+Format jawaban: gunakan paragraf pendek, emoji yang relevan, dan poin-poin singkat.
+Gunakan bahasa Indonesia yang profesional namun ramah — bukan formal kaku.
 JANGAN tampilkan JSON mentah.`;
 
-            const notaAnswer = await callAI(notaPrompt, true);
+            const notaAnswer = await callNemotron(notaPrompt, true);
             updateSession(phone, message, notaAnswer);
 
             return res.json({
@@ -487,36 +431,45 @@ JANGAN tampilkan JSON mentah.`;
         if (isHPPQuestion(message)) {
             console.log("   [📈 HPP question terdeteksi — thinking mode ON...]");
 
-            const hppData = await hitungHPP(storeId);
+            // Ambil data resep menu dari DB
+            const menuKeywordMatch = message.match(/(?:hpp|margin|untung|profit).*?(?:menu\s+)?["']?([a-zA-Z\s]+)["']?/i);
+            const menuKeyword = menuKeywordMatch ? menuKeywordMatch[1].trim() : null;
+
+            const hppData = await hitungHPP(storeId, menuKeyword);
 
             const hppPrompt = `
 WAJIB: Seluruh jawaban dalam Bahasa Indonesia. DILARANG menggunakan Bahasa Inggris.
 
 Kamu adalah Kazeer, bot AI Business Consultant untuk ${storeName}.
-Pertanyaan Owner: "${message}"
+Pertanyaan owner: "${message}"
 
-Berikut data resep dan referensi harga bahan dari database:
+Berikut data NYATA dari database — resep menu beserta referensi harga bahan dari catatan pembelian (cash_logs):
 ${JSON.stringify(hppData, null, 2)}
 
 CARA MENGHITUNG HPP:
-- Jika "referensi_harga_dari_cashlog" tersedia → gunakan total_bayar dari sana untuk mencari harga satuan.
-- HPP per bahan = (qty_used / total_qty_beli) × total_bayar.
+Untuk setiap bahan dalam menu:
+- Jika "referensi_harga_dari_cashlog" tersedia → gunakan total_bayar dari sana sebagai referensi harga beli
+- Jika "referensi_harga_dari_cashlog" = null → JANGAN mengarang harga. Tulis: "harga [nama bahan] tidak ditemukan di catatan pembelian"
+- HPP per bahan = (qty_used / total_qty_beli) × total_bayar — estimasikan berdasarkan proporsi qty_used
 
-TUGAS UTAMA:
-1. FOKUS HANYA PADA MENU YANG DITANYAKAN USER. Abaikan data menu lain yang tidak relevan dengan pertanyaan!
-2. 🧮 Tampilkan rincian perhitungan modal (HPP) per bahan baku khusus untuk menu tersebut.
-3. 💰 Hitung margin kotornya menggunakan harga jual yang baru (jika user memberikan harga baru di pertanyaan). Rumus: ((Harga Jual - Total HPP) / Harga Jual) × 100%
-4. 📊 Berikan kesimpulan apakah persentase margin tersebut sehat (Rendah <30%, Sedang 30-60%, Tinggi >60%).
-5. 💡 Berikan 1 rekomendasi bisnis singkat terkait harga tersebut.
+TUGAS (gunakan data di atas, JANGAN berasumsi di luar data):
+1. 🧮 Hitung HPP per menu berdasarkan data referensi harga yang tersedia
+2. 💰 Hitung margin kotor: ((harga_jual - HPP) / harga_jual) × 100%
+3. 📊 Kategorikan: Rendah < 30%, Sedang 30–60%, Tinggi > 60%
+4. 🏆 Sebutkan menu paling menguntungkan berdasarkan data
+5. ⚠️ Flagging menu margin rendah atau bahan yang harganya tidak tercatat
+6. 💡 Berikan 2–3 rekomendasi bisnis yang spesifik dan actionable
 
-ATURAN FORMAT (SANGAT PENTING - WAJIB DIIKUTI):
-- JAWABAN HARUS RAPI! WAJIB berikan ENTER (baris kosong ganda / line break) di antara setiap poin/paragraf. DILARANG menggabungkan jawaban menjadi satu paragraf panjang.
-- DILARANG menggunakan tanda bintang (*) atau format bold (teks tebal) dalam jawaban.
-- DILARANG menggunakan bullet • — gunakan angka (1. 2. 3.) atau susun ke bawah dengan rapi.
-- Format uang wajib pakai Rupiah (Rp 15.000).
-- JANGAN tampilkan teks JSON mentah.`;
+ATURAN FORMAT (WAJIB DIIKUTI):
+- DILARANG menggunakan tanda bintang (*) atau markdown bold (**teks**) dalam jawaban
+- DILARANG menggunakan bullet • — gunakan angka (1. 2. 3.) atau baris baru saja
+- Setiap poin diawali emoji, diikuti teks langsung tanpa tanda baca dekoratif
+- Pisahkan setiap poin dengan satu baris kosong
+- Format Rupiah: Rp 15.000 | Persentase: 45,5%
+- Jika ada bahan tanpa referensi harga, sebutkan dengan jelas di output
+- Jangan tampilkan JSON mentah`;
 
-            const hppAnswer = await callAI(hppPrompt, true); 
+            const hppAnswer = await callNemotron(hppPrompt, true); // thinking ON
             updateSession(phone, message, hppAnswer);
 
             return res.json({
@@ -528,7 +481,7 @@ ATURAN FORMAT (SANGAT PENTING - WAJIB DIIKUTI):
             });
         }
 
-       // ══════════════════════════════════════════════════════
+        // ══════════════════════════════════════════════════════
         // 🧠 FLOW UTAMA: SQL → DB → ANSWER
         // ══════════════════════════════════════════════════════
         const today = new Date().toISOString().split('T')[0];
@@ -572,6 +525,24 @@ NAMA BULAN: Jan=1 Feb=2 Mar=3 Apr=4 Mei=5 Jun=6 Jul=7 Agt=8 Sep=9 Okt=10 Nov=11 
 METODE PEMBAYARAN:
 tunai/cash → ILIKE '%cash%' | transfer/bank → ILIKE '%transfer%' | qris/digital/ewallet → ILIKE '%qris%'
 
+PEMETAAN KATEGORI MENU (SANGAT PENTING):
+Nama kategori di database BUKAN "minuman" atau "makanan" — gunakan pemetaan ini:
+
+| Kata user                                    | Filter kategori yang BENAR                                        |
+|----------------------------------------------|-------------------------------------------------------------------|
+| "minuman", "drink", "minum"                  | mc.name ILIKE '%kopi%' OR mc.name ILIKE '%non%'                   |
+| "kopi", "coffee"                             | mc.name ILIKE '%kopi%' AND mc.name NOT ILIKE '%non%'              |
+| "non kopi", "non-kopi", "bukan kopi"         | mc.name ILIKE '%non%'                                             |
+| "makanan", "food", "makan"                   | mc.name ILIKE '%makan%' OR mc.name ILIKE '%snack%'                |
+| "makanan berat", "main course", "nasi", "mie"| mc.name ILIKE '%makan%'                                           |
+| "snack", "cemilan", "dessert"                | mc.name ILIKE '%snack%'                                           |
+| (tidak ada filter kategori)                  | JANGAN JOIN ke menu_categories — query semua menu langsung        |
+
+ATURAN KATEGORI KRITIS:
+- DILARANG filter mc.name ILIKE '%minuman%' — tidak ada kategori bernama "minuman" di DB.
+- DILARANG filter mc.name ILIKE '%makanan%' — gunakan '%makan%' atau '%snack%'.
+- Jika user tanya "semua menu terlaris" tanpa sebut kategori → JANGAN JOIN menu_categories.
+
 PEMETAAN KATA KEUANGAN (ROUTING KE QUERY YANG TEPAT):
 | Kata kunci user                          | Query yang digunakan                                      |
 |------------------------------------------|-----------------------------------------------------------|
@@ -585,21 +556,14 @@ PEMETAAN KATA KEUANGAN (ROUTING KE QUERY YANG TEPAT):
 ATURAN KRITIS:
 - "sekarang"/"saat ini" = BULAN INI, bukan hari ini.
 - "total"/"keseluruhan" = HAPUS semua filter tanggal.
-- DILARANG hardcode tahun/bulan secara manual. Pakai CURRENT_DATE atau EXTRACT().
+- DILARANG hardcode tahun/bulan. Pakai CURRENT_DATE atau EXTRACT().
 - cash_logs gunakan cl.created_at.
-- [PENTING] CASTING TANGGAL: Selalu gunakan casting ::date atau ::timestamp pada string tanggal manual di dalam fungsi (Contoh: DATE_TRUNC('month', '2026-04-01'::date)).
 
 ============================
-SKEMA DATABASE (Daftar Kolom Penting)
+SKEMA DATABASE
 ============================
-- stores (id, store_name)
-- menu_categories (id, store_id, name)
-- menu_items (id, store_id, category_id, name, price)
-- menu_recipes (id, menu_item_id, inventory_id, qty_used)
-- inventory (id, store_id, item_name, current_stock, unit) <-- Gunakan 'current_stock' bukan 'stock'.
-- transactions (id, store_id, total_amount, transaction_date, payment_method, order_type, table_number)
-- transaction_details (id, transaction_id, menu_item_id, qty, subtotal) <-- Gunakan 'qty' bukan 'quantity'.
-- cash_logs (id, store_id, type, amount, description, created_at)
+stores | menu_categories | menu_items | menu_recipes | inventory
+transactions | transaction_details | cash_logs | whatsapp_users
 
 ============================
 ALIAS WAJIB
@@ -610,19 +574,26 @@ menu_categories→mc | inventory→inv | cash_logs→cl | menu_recipes→mr
 ============================
 ATURAN WAJIB
 ============================
-[1]  KEAMANAN: WAJIB store_id = ${storeId} pada semua tabel yang memilikinya.
-[2]  JOIN: WAJIB gunakan JOIN eksplisit (Contoh: td JOIN t ON td.transaction_id = t.id).
-[3]  NULL-SAFE: COALESCE(..., 0) pada semua agregat (SUM, COUNT).
+[1]  KEAMANAN: WAJIB store_id = ${storeId} pada: transactions, inventory, menu_items, menu_categories, cash_logs.
+[2]  ALIAS: Gunakan alias wajib tanpa kecuali.
+[3]  NULL-SAFE: COALESCE(..., 0) pada semua agregat.
 [4]  NAMA KOLOM: Selalu deskriptif (AS total_omzet, AS nama_menu, dll.).
-[5]  ILIKE: DILARANG menggunakan '=' untuk nama menu/kategori. Gunakan ILIKE.
+[5]  ILIKE: DILARANG = untuk nama menu/kategori.
 [6]  MULTI-PERIODE: Gunakan CTE (WITH ... AS).
-[7]  DATA KOSONG: JANGAN kembalikan PERTANYAAN_TIDAK_VALID jika tabel relevan ada. Biarkan query berjalan meskipun hasil mungkin 0.
-[8]  BAHAN TERPAKAI: SUM(td.qty * mr.qty_used) GROUP BY inv.item_name.
-[9]  HARI: EXTRACT(DOW FROM t.transaction_date). 0=Minggu, 6=Sabtu.
-[10] DIVISI NOL: CASE WHEN denominator=0 THEN NULL ELSE ROUND(n/d,2) END.
-[11] PARSING NOTA: Jika user minta mencatat pengeluaran/input nota: DILARANG gunakan INSERT. Kembalikan HANYA: SELECT 'PARSING_NOTA' AS status;
-[12] FOLLOW-UP: Gunakan konteks percakapan jika ada kata ganti (itu, tadi, tersebut).
-[13] NOTES: Jangan sertakan kecuali diminta.
+[7]  LABA/RUGI: pendapatan=SUM(t.total_amount), pengeluaran=SUM(cl.amount) WHERE cl.type='out'.
+[8]  DATA KOSONG: Jangan kembalikan PERTANYAAN_TIDAK_VALID jika tabel relevan ada. Biarkan query tetap jalan meski data mungkin kosong.
+[9]  BAHAN TERPAKAI: SUM(td.qty * mr.qty_used) GROUP BY inv.item_name.
+[10] HARI: EXTRACT(DOW). 0=Minggu, 6=Sabtu.
+[11] DIVISI NOL: CASE WHEN denominator=0 THEN NULL ELSE ROUND(n/d,2) END.
+[12] RANKING: DENSE_RANK() OVER (ORDER BY ... DESC).
+[13] MENU TIDAK TERJUAL: LEFT JOIN + WHERE td.id IS NULL.
+[14] MULTI-KEYWORD: mi.name ILIKE '%a%' OR mi.name ILIKE '%b%'.
+[15] FILTER NOMINAL: t.total_amount > [nilai].
+[16] PER MEJA: t.table_number.
+[17] RATA-RATA HARIAN: SUM / COUNT(DISTINCT t.transaction_date::date).
+[18] KONTRIBUSI (%): Gunakan CTE atau subquery.
+[19] FOLLOW-UP: Gunakan konteks percakapan jika ada kata "itu", "tadi", "lalu", "bandingkan".
+[20] NOTES: Jangan sertakan kecuali diminta.
 
 ============================
 CONTOH QUERY (FEW-SHOT)
@@ -631,14 +602,59 @@ CONTOH QUERY (FEW-SHOT)
 Pertanyaan: "total pendapatan keseluruhan"
 SQL: SELECT COALESCE(SUM(t.total_amount),0) AS total_pendapatan, COUNT(t.id) AS total_transaksi FROM transactions t WHERE t.store_id = ${storeId};
 
+Pertanyaan: "total pendapatan sekarang"
+SQL: SELECT COALESCE(SUM(t.total_amount),0) AS total_pendapatan, COUNT(t.id) AS total_transaksi FROM transactions t WHERE t.store_id = ${storeId} AND DATE_TRUNC('month', t.transaction_date) = DATE_TRUNC('month', CURRENT_DATE);
+
+Pertanyaan: "total pendapatan hari ini"
+SQL: SELECT COALESCE(SUM(t.total_amount),0) AS total_pendapatan, COUNT(t.id) AS total_transaksi FROM transactions t WHERE t.store_id = ${storeId} AND t.transaction_date::date = CURRENT_DATE;
+
 Pertanyaan: "5 menu terlaris bulan ini"
 SQL: SELECT mi.name AS nama_menu, COALESCE(SUM(td.qty),0) AS total_porsi, COALESCE(SUM(td.subtotal),0) AS total_pendapatan FROM transaction_details td JOIN transactions t ON td.transaction_id = t.id JOIN menu_items mi ON td.menu_item_id = mi.id WHERE t.store_id = ${storeId} AND DATE_TRUNC('month', t.transaction_date) = DATE_TRUNC('month', CURRENT_DATE) GROUP BY mi.name ORDER BY total_porsi DESC LIMIT 5;
+
+Pertanyaan: "minuman terlaris bulan ini" / "minuman paling laku"
+SQL: SELECT mi.name AS nama_menu, COALESCE(SUM(td.qty),0) AS total_porsi, COALESCE(SUM(td.subtotal),0) AS total_pendapatan FROM transaction_details td JOIN transactions t ON td.transaction_id = t.id JOIN menu_items mi ON td.menu_item_id = mi.id JOIN menu_categories mc ON mi.category_id = mc.id WHERE t.store_id = ${storeId} AND (mc.name ILIKE '%kopi%' OR mc.name ILIKE '%non%') AND DATE_TRUNC('month', t.transaction_date) = DATE_TRUNC('month', CURRENT_DATE) GROUP BY mi.name ORDER BY total_porsi DESC LIMIT 5;
+
+Pertanyaan: "minuman terlaris minggu ini"
+SQL: SELECT mi.name AS nama_menu, COALESCE(SUM(td.qty),0) AS total_porsi, COALESCE(SUM(td.subtotal),0) AS total_pendapatan FROM transaction_details td JOIN transactions t ON td.transaction_id = t.id JOIN menu_items mi ON td.menu_item_id = mi.id JOIN menu_categories mc ON mi.category_id = mc.id WHERE t.store_id = ${storeId} AND (mc.name ILIKE '%kopi%' OR mc.name ILIKE '%non%') AND DATE_TRUNC('week', t.transaction_date) = DATE_TRUNC('week', CURRENT_DATE) GROUP BY mi.name ORDER BY total_porsi DESC LIMIT 5;
+
+Pertanyaan: "makanan terlaris bulan ini"
+SQL: SELECT mi.name AS nama_menu, COALESCE(SUM(td.qty),0) AS total_porsi, COALESCE(SUM(td.subtotal),0) AS total_pendapatan FROM transaction_details td JOIN transactions t ON td.transaction_id = t.id JOIN menu_items mi ON td.menu_item_id = mi.id JOIN menu_categories mc ON mi.category_id = mc.id WHERE t.store_id = ${storeId} AND (mc.name ILIKE '%makan%' OR mc.name ILIKE '%snack%') AND DATE_TRUNC('month', t.transaction_date) = DATE_TRUNC('month', CURRENT_DATE) GROUP BY mi.name ORDER BY total_porsi DESC LIMIT 5;
+
+Pertanyaan: "omzet per kategori bulan ini"
+SQL: WITH total AS (SELECT COALESCE(SUM(total_amount),0) AS grand FROM transactions WHERE store_id = ${storeId} AND DATE_TRUNC('month', transaction_date) = DATE_TRUNC('month', CURRENT_DATE)) SELECT mc.name AS kategori, COALESCE(SUM(td.subtotal),0) AS total_omzet, COALESCE(SUM(td.qty),0) AS total_porsi, CASE WHEN total.grand = 0 THEN NULL ELSE ROUND((COALESCE(SUM(td.subtotal),0) / total.grand * 100)::numeric, 2) END AS persen_kontribusi FROM transaction_details td JOIN transactions t ON td.transaction_id = t.id JOIN menu_items mi ON td.menu_item_id = mi.id JOIN menu_categories mc ON mi.category_id = mc.id, total WHERE t.store_id = ${storeId} AND mc.store_id = ${storeId} AND DATE_TRUNC('month', t.transaction_date) = DATE_TRUNC('month', CURRENT_DATE) GROUP BY mc.name, total.grand ORDER BY total_omzet DESC;
+
+Pertanyaan: "omzet minggu ini vs minggu lalu"
+SQL: WITH minggu_ini AS (SELECT COALESCE(SUM(t.total_amount),0) AS omzet FROM transactions t WHERE t.store_id = ${storeId} AND DATE_TRUNC('week', t.transaction_date) = DATE_TRUNC('week', CURRENT_DATE)), minggu_lalu AS (SELECT COALESCE(SUM(t.total_amount),0) AS omzet FROM transactions t WHERE t.store_id = ${storeId} AND DATE_TRUNC('week', t.transaction_date) = DATE_TRUNC('week', CURRENT_DATE - INTERVAL '1 week')) SELECT a.omzet AS omzet_minggu_ini, b.omzet AS omzet_minggu_lalu, (a.omzet - b.omzet) AS selisih, CASE WHEN b.omzet = 0 THEN NULL ELSE ROUND(((a.omzet - b.omzet) / b.omzet * 100)::numeric, 2) END AS persentase_perubahan FROM minggu_ini a, minggu_lalu b;
 
 Pertanyaan: "rekap laba rugi bulan ini"
 SQL: WITH pendapatan AS (SELECT COALESCE(SUM(t.total_amount),0) AS total FROM transactions t WHERE t.store_id = ${storeId} AND DATE_TRUNC('month', t.transaction_date) = DATE_TRUNC('month', CURRENT_DATE)), pengeluaran AS (SELECT COALESCE(SUM(cl.amount),0) AS total FROM cash_logs cl WHERE cl.store_id = ${storeId} AND cl.type = 'out' AND DATE_TRUNC('month', cl.created_at) = DATE_TRUNC('month', CURRENT_DATE)) SELECT p.total AS total_pendapatan, k.total AS total_pengeluaran, (p.total - k.total) AS laba_bersih FROM pendapatan p, pengeluaran k;
 
-Pertanyaan: "laporan stok bahan baku"
+Pertanyaan: "menu yang belum pernah terjual bulan ini"
+SQL: SELECT mi.name AS nama_menu, mi.price AS harga FROM menu_items mi LEFT JOIN (SELECT td.menu_item_id FROM transaction_details td JOIN transactions t ON td.transaction_id = t.id WHERE t.store_id = ${storeId} AND DATE_TRUNC('month', t.transaction_date) = DATE_TRUNC('month', CURRENT_DATE)) sold ON mi.id = sold.menu_item_id WHERE mi.store_id = ${storeId} AND sold.menu_item_id IS NULL ORDER BY mi.name;
+
+Pertanyaan: "estimasi bahan terpakai bulan ini"
+SQL: SELECT inv.item_name AS bahan_baku, inv.unit, COALESCE(SUM(td.qty * mr.qty_used),0) AS estimasi_terpakai FROM transaction_details td JOIN transactions t ON td.transaction_id = t.id JOIN menu_items mi ON td.menu_item_id = mi.id JOIN menu_recipes mr ON mr.menu_item_id = mi.id JOIN inventory inv ON inv.id = mr.inventory_id WHERE t.store_id = ${storeId} AND inv.store_id = ${storeId} AND DATE_TRUNC('month', t.transaction_date) = DATE_TRUNC('month', CURRENT_DATE) GROUP BY inv.item_name, inv.unit ORDER BY estimasi_terpakai DESC;
+
+Pertanyaan: "berapa untung saya bulan ini" / "laba bulan ini" / "profit bulan ini"
+SQL: WITH pendapatan AS (SELECT COALESCE(SUM(t.total_amount),0) AS total FROM transactions t WHERE t.store_id = ${storeId} AND DATE_TRUNC('month', t.transaction_date) = DATE_TRUNC('month', CURRENT_DATE)), pengeluaran AS (SELECT COALESCE(SUM(cl.amount),0) AS total FROM cash_logs cl WHERE cl.store_id = ${storeId} AND cl.type = 'out' AND DATE_TRUNC('month', cl.created_at) = DATE_TRUNC('month', CURRENT_DATE)) SELECT p.total AS total_pendapatan, k.total AS total_pengeluaran, (p.total - k.total) AS laba_bersih FROM pendapatan p, pengeluaran k;
+
+Pertanyaan: "laporan stok bahan baku" / "stok bahan"
 SQL: SELECT inv.item_name AS bahan_baku, inv.current_stock AS stok_saat_ini, inv.unit FROM inventory inv WHERE inv.store_id = ${storeId} ORDER BY inv.current_stock ASC;
+
+Pertanyaan: "stok bahan paling menipis"
+SQL: SELECT inv.item_name AS bahan_baku, inv.current_stock AS stok_saat_ini, inv.unit FROM inventory inv WHERE inv.store_id = ${storeId} ORDER BY inv.current_stock ASC LIMIT 10;
+
+Pertanyaan: "total pengeluaran kas bulan ini"
+SQL: SELECT COALESCE(SUM(cl.amount),0) AS total_pengeluaran, COUNT(cl.id) AS jumlah_transaksi FROM cash_logs cl WHERE cl.store_id = ${storeId} AND cl.type = 'out' AND DATE_TRUNC('month', cl.created_at) = DATE_TRUNC('month', CURRENT_DATE);
+
+Pertanyaan: "omzet per meja bulan ini"
+SQL: SELECT t.table_number AS nomor_meja, COUNT(t.id) AS jumlah_transaksi, COALESCE(SUM(t.total_amount),0) AS total_omzet FROM transactions t WHERE t.store_id = ${storeId} AND t.order_type = 'dine_in' AND DATE_TRUNC('month', t.transaction_date) = DATE_TRUNC('month', CURRENT_DATE) GROUP BY t.table_number ORDER BY total_omzet DESC;
+
+Pertanyaan: "perbandingan dine-in vs takeaway bulan ini"
+SQL: SELECT t.order_type, COUNT(t.id) AS jumlah_transaksi, COALESCE(SUM(t.total_amount),0) AS total_omzet, ROUND(COALESCE(AVG(t.total_amount),0)::numeric,0) AS rata_rata_transaksi FROM transactions t WHERE t.store_id = ${storeId} AND DATE_TRUNC('month', t.transaction_date) = DATE_TRUNC('month', CURRENT_DATE) GROUP BY t.order_type ORDER BY total_omzet DESC;
+
+Pertanyaan: "rata-rata omzet per hari bulan ini"
+SQL: SELECT ROUND(COALESCE(SUM(t.total_amount),0) / NULLIF(COUNT(DISTINCT t.transaction_date::date), 0), 0) AS rata_rata_omzet_per_hari, COUNT(DISTINCT t.transaction_date::date) AS jumlah_hari_aktif FROM transactions t WHERE t.store_id = ${storeId} AND DATE_TRUNC('month', t.transaction_date) = DATE_TRUNC('month', CURRENT_DATE);
 
 Pertanyaan: "omzet akhir pekan vs hari kerja bulan ini"
 SQL: WITH klasifikasi AS (SELECT CASE WHEN EXTRACT(DOW FROM t.transaction_date) IN (0,6) THEN 'Akhir Pekan' ELSE 'Hari Kerja' END AS tipe_hari, t.total_amount FROM transactions t WHERE t.store_id = ${storeId} AND DATE_TRUNC('month', t.transaction_date) = DATE_TRUNC('month', CURRENT_DATE)) SELECT tipe_hari, COUNT(*) AS jumlah_transaksi, COALESCE(SUM(total_amount),0) AS total_omzet, ROUND(COALESCE(AVG(total_amount),0)::numeric,0) AS rata_rata_transaksi FROM klasifikasi GROUP BY tipe_hari ORDER BY total_omzet DESC;
@@ -652,19 +668,11 @@ FORMAT OUTPUT
 
         console.log("   [⏳ Step A: Generating SQL...]");
         const promptToSQL = `${SYSTEM_PROMPT}\n\nPertanyaan: "${message}"\nQuery SQL:`;
-        let sqlQuery = await callAI(promptToSQL, false);
+        let sqlQuery = await callNemotron(promptToSQL, false);
         sqlQuery = sqlQuery.replace(/```sql/ig, '').replace(/```/g, '').trim();
 
         validateSQL(sqlQuery, storeId);
         console.log("   [💻 Execute SQL]:", sqlQuery);
-
-        if (sqlQuery.includes('PARSING_NOTA')) {
-            return res.json({
-                success: true,
-                answer: "🧾 Wah, ini sepertinya rincian belanja ya Owner? Biar sistem bisa otomatis merekap dan menjumlahkannya, tolong tambahkan kata **nota:** di awal pesan ya! \n\nContoh: *nota: beli sabun 15rb*",
-                sql: sqlQuery, rawData: []
-            });
-        }
 
         if (sqlQuery.includes('PERTANYAAN_TIDAK_VALID')) {
             return res.json({
@@ -676,12 +684,13 @@ FORMAT OUTPUT
 
         const dbResult = await sql.unsafe(sqlQuery);
 
-        const safeData = dbResult.length > 20 ? dbResult.slice(0, 20) : dbResult;
+        const safeData = dbResult.length > 15 ? dbResult.slice(0, 15) : dbResult;
         let dataToAI = JSON.stringify(safeData);
-        if (dbResult.length > 20) {
-            dataToAI += `\n(Catatan: Ditampilkan 20 data teratas dari total ${dbResult.length} baris.)`;
+        if (dbResult.length > 15) {
+            dataToAI += `\n(Catatan: Ditampilkan 15 data teratas dari total ${dbResult.length} baris.)`;
         }
 
+        // Inject konteks rentang data jika kosong
         let dataRangeContext = '';
         const isEmptyOrZero = safeData.length === 0 ||
             safeData.every(row => Object.values(row).every(v => v === null || v === 0 || v === '0'));
@@ -689,43 +698,42 @@ FORMAT OUTPUT
         if (isEmptyOrZero) {
             const range = await getDataRange(storeId);
             if (range?.total_transaksi > 0) {
-                dataRangeContext = `\nINFO: Database memiliki ${range.total_transaksi} transaksi dari ${range.tanggal_pertama} hingga ${range.tanggal_terakhir}. Kemungkinan kata kunci tidak ditemukan atau belum ada transaksi di periode ini.`;
+                dataRangeContext = `\nINFO: Database memiliki ${range.total_transaksi} transaksi dari ${range.tanggal_pertama} hingga ${range.tanggal_terakhir}. Periode yang ditanyakan kemungkinan belum ada transaksinya.`;
             }
         }
 
-       console.log("   [⏳ Step C: Kazeer menyusun jawaban...]");
-       const promptToSummary = `
+        // 🧠 STEP C: KAZEER ANSWER GENERATOR
+        console.log("   [⏳ Step C: Kazeer menyusun jawaban...]");
+        const promptToSummary = `
 WAJIB: Seluruh jawaban dalam Bahasa Indonesia. DILARANG menggunakan Bahasa Inggris dalam jawaban akhir.
 
 Kamu adalah Kazeer, bot AI Business Consultant untuk ${storeName}.
+Kamu pintar, informatif, dan selalu memberikan insight bisnis yang valuable — seperti ChatGPT tapi khusus untuk bisnis cafe/resto.
 
-Pertanyaan Owner: "${message}"
+Pertanyaan: "${message}"
 Data dari database: ${dataToAI}${dataRangeContext}
 
-ATURAN FORMAT JAWABAN (SANGAT PENTING - WAJIB DIIKUTI):
-Kamu WAJIB memisahkan setiap bagian dengan baris kosong ganda (ENTER). DILARANG KERAS menggabungkan semua kalimat menjadi satu paragraf panjang!
+Riwayat percakapan:
+${conversationHistory || '(Tidak ada riwayat)'}
 
-Gunakan struktur persis seperti ini (harus ada spasi kosong antar bagian):
+CARA MENJAWAB:
+1. Setiap poin diawali emoji yang relevan, diikuti teks langsung
+2. Pisahkan setiap poin dengan satu baris kosong agar mudah dibaca
+3. Maksimal 2-3 kalimat per poin — jangan wall of text
+4. Selalu akhiri dengan 1 insight bisnis yang actionable dan spesifik
+5. Bahasa Indonesia yang profesional tapi tetap ramah
+6. Format Rupiah: Rp 1.250.000 | Persentase: 23,5%
+7. Untuk daftar atau ranking: gunakan angka (1. 2. 3.) bukan bullet
+8. Jika data kosong: jelaskan dengan sopan + sebutkan rentang data yang tersedia
+9. Jika ada persentase naik/turun: jelaskan artinya dalam konteks bisnis
+10. Jika pertanyaan adalah follow-up: jawab mengacu konteks sebelumnya
 
-[Emoji] [Kalimat Pembuka/Sapaan ke Owner]
+DILARANG KERAS:
+- Menggunakan tanda bintang (*) atau markdown bold (**teks**) dalam jawaban
+- Menampilkan JSON, kode teknis, atau simbol programming
+- Mengarang angka yang tidak ada di data`;
 
-[Emoji] [Kalimat Pengantar Rincian]
-1. [Rincian 1]
-2. [Rincian 2]
-
-[Emoji] Total Keseluruhan: Rp [X]
-
-💡 Insight Bisnis: [Saran spesifik dan actionable dari kamu]
-
-ATURAN TAMBAHAN:
-1. [PENTING] JIKA MENDAPATKAN RINCIAN PENGELUARAN (description & amount): Kamu wajib menjumlahkannya sendiri secara matematis dan tampilkan TOTAL keseluruhannya sesuai template di atas.
-2. Gunakan sebutan "Owner" atau "Pemilik". DILARANG menggunakan kata "Bos".
-3. Format Rupiah: Rp 1.250.000 (tanpa desimal .00)
-4. Untuk daftar: HANYA gunakan angka (1. 2. 3.) BUKAN bullet.
-5. DILARANG KERAS menggunakan tanda bintang (*) atau markdown bold dalam jawaban.
-6. DILARANG Menampilkan JSON mentah.`;
-
-        const finalAnswer = await callAI(promptToSummary, true);
+        const finalAnswer = await callNemotron(promptToSummary, true);
         updateSession(phone, message, finalAnswer);
 
         console.log("   [✅ Done]");
@@ -735,7 +743,7 @@ ATURAN TAMBAHAN:
         console.error("❌ Error:", error.message);
         res.status(500).json({
             success: false,
-            answer: "⚠️ Maaf, terjadi kendala teknis saat memproses permintaan.\n\nSilakan coba beberapa saat lagi. 🙏",
+            answer: "⚠️ Maaf, terjadi kendala teknis saat memproses permintaan kamu.\n\nSilakan coba beberapa saat lagi. 🙏",
             error: error.message
         });
     }
@@ -751,9 +759,9 @@ app.post('/api/catat-nota', async (req, res) => {
         const userCheck = await sql`
             SELECT u.store_id FROM whatsapp_users u WHERE u.phone_number = ${phone}
         `;
-        
-        // 🔥 MODE DEMO: Default ke Store ID 1 🔥
-        const storeId = userCheck.length === 0 ? 1 : userCheck[0].store_id;
+        if (userCheck.length === 0) return res.status(403).json({ success: false });
+
+        const storeId = userCheck[0].store_id;
         const total = items.reduce((sum, i) => sum + (i.subtotal || 0), 0);
 
         await sql`
@@ -784,13 +792,13 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, '0.0.0.0', () => {
     console.log(`
 ╔════════════════════════════════════════╗
-║        🤖 KAZEER AI v2.0.0             ║
-║        Business Consultant Bot         ║
+║        🤖 KAZEER AI v2.0.0            ║
+║        Business Consultant Bot        ║
 ╠════════════════════════════════════════╣
 ║  🔗 Port    : ${PORT}                    ║
-║  👥 Mode    : Multi-Tenant             ║
-║  🧠 Engine  : Llama 4 Maverick (Fetch) ║
-║  📦 Features: SQL · Nota · HPP         ║
+║  👥 Mode    : Multi-Tenant            ║
+║  🧠 Engine  : NVIDIA Nemotron         ║
+║  📦 Features: SQL · Nota · HPP       ║
 ╚════════════════════════════════════════╝
     `);
 });
