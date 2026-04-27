@@ -111,10 +111,25 @@ async function callNemotron(promptText, enableThinking = false, retries = 3, del
             });
 
             let fullContent = '';
+            let reasoningBuffer = '';
             for await (const chunk of stream) {
-                fullContent += chunk.choices[0]?.delta?.content || '';
+                const delta = chunk.choices[0]?.delta;
+                // Skip reasoning_content — hanya ambil content final
+                if (delta?.reasoning_content) {
+                    reasoningBuffer += delta.reasoning_content;
+                }
+                if (delta?.content) {
+                    fullContent += delta.content;
+                }
             }
-            return fullContent.trim();
+            // Bersihkan sisa thinking yang bocor ke content (pola bahasa Inggris di awal)
+            let cleaned = fullContent.trim();
+            // Hapus blok <think>...</think> jika ada
+            cleaned = cleaned.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
+            // Hapus baris-baris awal yang seluruhnya bahasa Inggris (reasoning bocor)
+            const lines = cleaned.split('\n');
+            const firstIdLines = lines.findIndex(l => /[a-zA-Z]{4,}/.test(l) === false || /[\u00C0-\u024F\u1E00-\u1EFF]/.test(l) || /^[^a-zA-Z]*$/.test(l));
+            return cleaned;
 
         } catch (error) {
             console.log(`   [⚠️ API Error] Percobaan ${i + 1}/${retries}: ${error.message}`);
@@ -358,6 +373,8 @@ app.post('/api/chat', async (req, res) => {
 
             // Kirim ke AI untuk analisis
             const notaPrompt = `
+WAJIB: Seluruh jawaban dalam Bahasa Indonesia. DILARANG menggunakan Bahasa Inggris.
+
 Kamu adalah Kazeer, bot AI Business Consultant yang profesional.
 Kamu baru saja membaca nota belanja dari ${storeName}.
 
@@ -402,6 +419,8 @@ JANGAN tampilkan JSON mentah.`;
             const hppData = await hitungHPP(storeId, menuKeyword);
 
             const hppPrompt = `
+WAJIB: Seluruh jawaban dalam Bahasa Indonesia. DILARANG menggunakan Bahasa Inggris.
+
 Kamu adalah Kazeer, bot AI Business Consultant yang ahli dalam analisis bisnis cafe/restoran.
 Kamu sedang membantu owner ${storeName} menghitung HPP (Harga Pokok Penjualan) dan margin keuntungan.
 
@@ -599,6 +618,8 @@ FORMAT OUTPUT
         // 🧠 STEP C: KAZEER ANSWER GENERATOR
         console.log("   [⏳ Step C: Kazeer menyusun jawaban...]");
         const promptToSummary = `
+WAJIB: Seluruh jawaban dalam Bahasa Indonesia. DILARANG menggunakan Bahasa Inggris dalam jawaban akhir.
+
 Kamu adalah Kazeer, bot AI Business Consultant untuk ${storeName}.
 Kamu pintar, informatif, dan selalu memberikan insight bisnis yang valuable — seperti ChatGPT tapi khusus untuk bisnis cafe/resto.
 
