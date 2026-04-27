@@ -10,7 +10,10 @@ if (!token) {
 
 // Inisialisasi Bot Telegram dengan mode polling
 const bot = new TelegramBot(token, { polling: true });
-const SERVER_URL = `http://127.0.0.1:${process.env.PORT || 3000}`;
+
+// 🔥 PERBAIKAN URL: Gunakan localhost atau 0.0.0.0 yang lebih ramah dengan Railway
+const port = process.env.PORT || 3000;
+const SERVER_URL = `http://localhost:${port}`; 
 
 console.log(`
 🤖 Telegram Bot Klien: AKTIF!
@@ -18,52 +21,56 @@ console.log(`
 `);
 
 bot.on('message', async (msg) => {
-    const chatId = msg.chat.id.toString(); // Gunakan Chat ID sebagai pengganti Nomor HP
+    const chatId = msg.chat.id.toString(); 
     const messageText = msg.text;
 
     if (!messageText) return;
 
     console.log(`\n📨 [Telegram] Menerima pesan dari ID ${chatId}: "${messageText}"`);
 
-    // Tampilkan status "Sedang mengetik..." di aplikasi Telegram user
     bot.sendChatAction(chatId, 'typing');
 
     try {
-        // Tembak API lokal server.js kita sendiri
+        console.log(`   [Telegram] Meneruskan pesan ke ${SERVER_URL}/api/chat...`);
+        
         const response = await fetch(`${SERVER_URL}/api/chat`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ 
                 message: messageText, 
-                phone: chatId // Kita samarkan chatId sebagai "phone" agar diterima server.js
+                phone: chatId 
             })
         });
 
+        // Tangkap jika fetch gagal (misal server belum siap)
+        if (!response.ok) {
+            console.error(`❌ Server mengembalikan status: ${response.status}`);
+        }
+
         const data = await response.json();
 
-        // Jika server.js menolak (karena ID belum terdaftar di database)
         if (response.status === 403) {
             return bot.sendMessage(
                 chatId, 
-                `⚠️ *Akses Ditolak*\n\nMaaf, ID Telegram Anda (\`${chatId}\`) belum terdaftar di sistem. Harap hubungi Admin untuk mendaftarkan ID ini.`,
+                `⚠️ *Akses Ditolak*\n\nMaaf, ID Telegram Anda (\`${chatId}\`) belum terdaftar di sistem.`,
                 { parse_mode: 'Markdown' }
             );
         }
 
-        // Jika server sibuk / rate limit
         if (response.status === 429) {
             return bot.sendMessage(chatId, "⏳ Tunggu sebentar Owner, permintaan sedang padat.");
         }
 
-        // Jika sukses, kirim jawaban dari AI (server.js) kembali ke Telegram
         if (data.success && data.answer) {
+            console.log(`   [Telegram] Sukses menerima jawaban dari AI.`);
             bot.sendMessage(chatId, data.answer);
         } else {
             bot.sendMessage(chatId, "⚠️ Maaf, AI tidak memberikan respons yang valid.");
         }
 
     } catch (error) {
-        console.error("❌ Error Telegram to Server:", error.message);
-        bot.sendMessage(chatId, "🔌 Waduh, sepertinya `server.js` sedang mati atau tidak bisa dihubungi. Pastikan server utamanya sudah jalan ya, Owner!");
+        // 🔥 Tambahkan log error lengkap di sini agar terlihat di Railway
+        console.error("❌ Error Telegram to Server Detail:", error);
+        bot.sendMessage(chatId, "🔌 Waduh, sepertinya `server.js` sedang mati atau tidak bisa dihubungi. Cek log server ya, Owner!");
     }
 });
