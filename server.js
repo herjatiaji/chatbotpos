@@ -334,18 +334,33 @@ app.post('/api/chat', async (req, res) => {
     try {
         console.log(`\n💬 [${phone}] "${message}"`);
 
-        const userCheck = await sql`
-            SELECT u.owner_name, u.store_id, s.store_name 
-            FROM whatsapp_users u 
-            JOIN stores s ON u.store_id = s.id 
-            WHERE u.phone_number = ${phone}
-        `;
+        // ============================================
+        // 🎮 DEMO MODE — paksa semua ID ke Store 1
+        // Set DEMO_MODE = false untuk production
+        // ============================================
+        const DEMO_MODE = true;
 
-        if (userCheck.length === 0) {
-            return res.status(403).json({ success: false, answer: "Mohon maaf, nomor Anda tidak terdaftar dalam sistem Kazeer AI." });
+        let activeUser;
+
+        if (DEMO_MODE) {
+            // Bypass DB — semua pengguna otomatis masuk Store 1
+            activeUser = { owner_name: 'Demo Owner', store_id: 1, store_name: 'Bengkel Kopi' };
+            console.log(`   [🎮 Demo] ${phone} → Store 1 (${activeUser.store_name})`);
+        } else {
+            const userCheck = await sql\`
+                SELECT u.owner_name, u.store_id, s.store_name 
+                FROM whatsapp_users u 
+                JOIN stores s ON u.store_id = s.id 
+                WHERE u.phone_number = \${phone}
+            \`;
+
+            if (userCheck.length === 0) {
+                return res.status(403).json({ success: false, answer: "Mohon maaf, nomor Anda tidak terdaftar dalam sistem Kazeer AI." });
+            }
+
+            activeUser = userCheck[0];
         }
 
-        const activeUser = userCheck[0];
         const storeId = activeUser.store_id;
         const storeName = activeUser.store_name;
 
@@ -756,12 +771,8 @@ app.post('/api/catat-nota', async (req, res) => {
     const { phone, items, description } = req.body;
 
     try {
-        const userCheck = await sql`
-            SELECT u.store_id FROM whatsapp_users u WHERE u.phone_number = ${phone}
-        `;
-        if (userCheck.length === 0) return res.status(403).json({ success: false });
-
-        const storeId = userCheck[0].store_id;
+        // 🎮 Demo Mode — semua ke Store 1
+        const storeId = 1;
         const total = items.reduce((sum, i) => sum + (i.subtotal || 0), 0);
 
         await sql`
