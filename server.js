@@ -426,14 +426,14 @@ JANGAN tampilkan JSON mentah.`;
         // ══════════════════════════════════════════════════════
         // 📈 FLOW: HPP & MARGIN CALCULATOR
         // ══════════════════════════════════════════════════════
+// ══════════════════════════════════════════════════════
+        // 📈 FLOW: HPP & MARGIN CALCULATOR
+        // ══════════════════════════════════════════════════════
         if (isHPPQuestion(message)) {
             console.log("   [📈 HPP question terdeteksi — thinking mode ON...]");
 
-            // Ambil data resep menu dari DB
-            const menuKeywordMatch = message.match(/(?:hpp|margin|untung|profit).*?(?:menu\s+)?["']?([a-zA-Z\s]+)["']?/i);
-            const menuKeyword = menuKeywordMatch ? menuKeywordMatch[1].trim() : null;
-
-            const hppData = await hitungHPP(storeId, menuKeyword);
+            // Tarik SEMUA data resep dan biarkan Kazeer AI yang mencari menu mana yang relevan
+            const hppData = await hitungHPP(storeId);
 
             const hppPrompt = `
 WAJIB: Seluruh jawaban dalam Bahasa Indonesia. DILARANG menggunakan Bahasa Inggris.
