@@ -568,6 +568,7 @@ ATURAN WAJIB (BACA DENGAN TELITI)
 [5]  [PENTING] PENGELUARAN SPESIFIK: Jika user menanyakan "pengeluaran untuk X dan Y" (contoh: gaji, sewa, listrik), JANGAN gunakan SUM(). Kamu WAJIB menggunakan SELECT description, amount, created_at FROM cash_logs. 
 [6]  [PENTING] KATA KUNCI DASAR: Gunakan akar kata saja untuk ILIKE. Contoh: jika user tanya "gaji karyawan", gunakan ILIKE '%gaji%'. Jika tanya "sewa tempat", gunakan ILIKE '%sewa%'.
 [7]  [PENTING] Jika user meminta untuk mencatat pengeluaran, input nota, atau membayar sesuatu: DILARANG KERAS menggunakan query INSERT. Kamu WAJIB mengembalikan: SELECT 'PARSING_NOTA' AS status;
+[8]  [PENTING] CASTING TANGGAL: PostgreSQL wajib tahu tipe data tanggal. Jika menggunakan string tanggal spesifik di dalam fungsi, WAJIB tambahkan ::date. (Contoh BENAR: DATE_TRUNC('month', '2026-04-01'::date). Contoh SALAH: DATE_TRUNC('month', '2026-04-01')).
 
 ============================
 CONTOH QUERY (FEW-SHOT)
