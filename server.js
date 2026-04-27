@@ -34,10 +34,11 @@ const SESSION_TTL = 30 * 60 * 1000;
 
 function getSession(phone) {
     const session = sessionStore.get(phone);
-    if (!session) return { history: [], lastActive: Date.now() };
+    // Tambahkan pendingNota untuk menampung data sebelum konfirmasi
+    if (!session) return { history: [], lastActive: Date.now(), pendingNota: null };
     if (Date.now() - session.lastActive > SESSION_TTL) {
         sessionStore.delete(phone);
-        return { history: [], lastActive: Date.now() };
+        return { history: [], lastActive: Date.now(), pendingNota: null };
     }
     return session;
 }
@@ -76,8 +77,10 @@ function validateSQL(sqlQuery, storeId) {
     if (!/^\s*(?:WITH\s+\w|SELECT\s)/i.test(sqlQuery)) {
         throw new Error('SQL tidak aman: hanya SELECT atau CTE yang diizinkan.');
     }
+    // Izinkan bypass jika statusnya PARSING_NOTA
+    const isFallback = sqlQuery.includes('PERTANYAAN_TIDAK_VALID') || sqlQuery.includes('PARSING_NOTA');
     const storeIdPattern = new RegExp(`store_id\\s*=\\s*${storeId}(?!\\d)`);
-    if (!storeIdPattern.test(sqlQuery)) {
+    if (!storeIdPattern.test(sqlQuery) && !isFallback) {
         throw new Error(`SQL tidak aman: tidak ada filter store_id = ${storeId}.`);
     }
 }
@@ -122,7 +125,6 @@ async function callAI(promptText, enableThinking = false, retries = 3, delay = 5
                 continue;
             }
 
-            // Membaca stream menggunakan Web Streams API
             const reader = response.body.getReader();
             const decoder = new TextDecoder('utf-8');
             let fullContent = '';
@@ -135,7 +137,6 @@ async function callAI(promptText, enableThinking = false, retries = 3, delay = 5
                 buffer += decoder.decode(value, { stream: true });
                 const lines = buffer.split('\n');
                 
-                // Simpan baris terakhir ke buffer karena mungkin belum komplit
                 buffer = lines.pop();
 
                 for (const line of lines) {
@@ -198,17 +199,13 @@ function isChitchat(message) {
 // HELPER: Deteksi apakah pesan adalah nota/struk
 // ==========================================
 function isNota(message) {
-    const notaPatterns = [
-        /nota[:\s]/i,
-        /struk[:\s]/i,
-        /receipt[:\s]/i,
-        /baca\s+nota/i,
-        /input\s+nota/i,
-        /catat\s+nota/i,
-        /\d+\s*[xX]\s*\d+/,
-        /rp\.?\s*\d{3,}/i,
-    ];
-    return notaPatterns.some(p => p.test(message.trim()));
+    const msg = message.toLowerCase();
+    // Lebih sensitif: langsung tangkap jika ada niat mencatat pengeluaran
+    if (msg.includes('nota') || msg.includes('struk') || msg.includes('catat')) return true;
+    if ((msg.includes('beli') || msg.includes('bayar')) && /\d/.test(msg)) return true;
+    
+    const notaPatterns = [/\d+\s*[xX]\s*\d+/, /rp\.?\s*\d{3,}/i];
+    return notaPatterns.some(p => p.test(msg));
 }
 
 // ==========================================
@@ -379,6 +376,42 @@ app.post('/api/chat', async (req, res) => {
         }
 
         const session = getSession(phone);
+
+        // ══════════════════════════════════════════════════════
+        // ✅ FLOW: KONFIRMASI SIMPAN NOTA
+        // ══════════════════════════════════════════════════════
+        if (message.toLowerCase() === 'simpan' && session.pendingNota) {
+            console.log("   [📥 Menyimpan nota ke Database...]");
+            const { total, description } = session.pendingNota;
+
+            await sql`
+                INSERT INTO cash_logs (store_id, type, amount, description, created_at)
+                VALUES (${storeId}, 'out', ${total}, ${description}, NOW())
+            `;
+
+            // Reset pendingNota setelah berhasil
+            session.pendingNota = null;
+            sessionStore.set(phone, session);
+
+            return res.json({
+                success: true,
+                answer: `✅ Siap Bos! Pengeluaran sebesar Rp ${total.toLocaleString('id-ID')} sudah berhasil dicatat ke laporan keuangan ${storeName}.\n\nAda lagi yang bisa Kazeer bantu? 🚀`,
+                sql: null,
+                rawData: []
+            });
+        }
+
+        if (message.toLowerCase() === 'batal' && session.pendingNota) {
+            session.pendingNota = null;
+            sessionStore.set(phone, session);
+            return res.json({ 
+                success: true, 
+                answer: "Oke Bos, pencatatan nota dibatalkan. 👌", 
+                sql: null, 
+                rawData: [] 
+            });
+        }
+
         const conversationHistory = session.history
             .map(h => `${h.role === 'user' ? 'Owner' : 'Kazeer'}: ${h.content}`)
             .join('\n');
@@ -393,13 +426,22 @@ app.post('/api/chat', async (req, res) => {
             if (items.length === 0) {
                 return res.json({
                     success: true,
-                    answer: "⚠️ Maaf, saya tidak berhasil membaca nota tersebut.\n\nCoba format seperti ini:\n\nnota:\n1. Kopi Arabika 500gr x 2 = Rp 90.000\n2. Gula Pasir 1kg x 1 = Rp 15.000",
+                    answer: "⚠️ Maaf Bos, Kazeer nggak berhasil baca detail itemnya. Coba ketik yang lebih jelas ya!\n\nContoh:\nnota: beli sabun cuci 15rb",
                     sql: null,
                     rawData: []
                 });
             }
 
             const totalNota = items.reduce((sum, i) => sum + (i.subtotal || 0), 0);
+            const itemDescription = items.map(i => `${i.nama_item} (${i.qty})`).join(', ');
+
+            // Simpan ke state untuk konfirmasi selanjutnya
+            session.pendingNota = {
+                items: items,
+                total: totalNota,
+                description: `Belanja: ${itemDescription}`
+            };
+            sessionStore.set(phone, session);
 
             const notaPrompt = `
 WAJIB: Seluruh jawaban dalam Bahasa Indonesia. DILARANG menggunakan Bahasa Inggris.
@@ -417,7 +459,7 @@ Tugas kamu:
 2. Tampilkan total belanja
 3. Kelompokkan per kategori (bahan_baku, operasional, dll)
 4. Berikan 1-2 insight bisnis singkat (apakah pengeluaran ini wajar? ada yang perlu diperhatikan?)
-5. Tanyakan apakah owner ingin mencatat pengeluaran ini ke cash_logs
+5. TANYAKAN DENGAN JELAS: "Apakah data ini sudah benar Bos? Balas SIMPAN untuk mencatat ke kas, atau BATAL."
 
 Format jawaban: gunakan paragraf pendek, emoji yang relevan, dan poin-poin singkat (Gunakan angka 1, 2, 3, BUKAN bullet).
 WAJIB berikan jarak baris ganda (enter) antar paragraf/poin.
@@ -530,6 +572,7 @@ ATURAN WAJIB (BACA DENGAN TELITI)
 [4]  LABA/RUGI: pendapatan=SUM(t.total_amount), pengeluaran=SUM(cl.amount) WHERE cl.type='out'.
 [5]  [PENTING] PENGELUARAN SPESIFIK: Jika user menanyakan "pengeluaran untuk X dan Y" (contoh: gaji, sewa, listrik), JANGAN gunakan SUM(). Kamu WAJIB menggunakan SELECT description, amount, created_at FROM cash_logs. 
 [6]  [PENTING] KATA KUNCI DASAR: Gunakan akar kata saja untuk ILIKE. Contoh: jika user tanya "gaji karyawan", gunakan ILIKE '%gaji%'. Jika tanya "sewa tempat", gunakan ILIKE '%sewa%'.
+[7]  [PENTING] Jika user meminta untuk mencatat pengeluaran, input nota, atau membayar sesuatu: DILARANG KERAS menggunakan query INSERT. Kamu WAJIB mengembalikan: SELECT 'PARSING_NOTA' AS status;
 
 ============================
 CONTOH QUERY (FEW-SHOT)
@@ -558,6 +601,15 @@ FORMAT OUTPUT
 
         validateSQL(sqlQuery, storeId);
         console.log("   [💻 Execute SQL]:", sqlQuery);
+
+        // Perangkap jika AI mencoba mem-parsing nota tapi lolos dari deteksi isNota
+        if (sqlQuery.includes('PARSING_NOTA')) {
+            return res.json({
+                success: true,
+                answer: "🧾 Wah, ini sepertinya rincian belanja ya Bos? Biar sistem bisa otomatis merekap dan menjumlahkannya, tolong tambahkan kata **nota:** di awal pesanmu ya! \n\nContoh: *nota: beli sabun 15rb*",
+                sql: sqlQuery, rawData: []
+            });
+        }
 
         if (sqlQuery.includes('PERTANYAAN_TIDAK_VALID')) {
             return res.json({
@@ -628,9 +680,8 @@ DILARANG KERAS:
 });
 
 // ==========================================
-// ENDPOINT: Simpan hasil parsing nota ke cash_logs
+// ENDPOINT: Simpan hasil parsing nota ke cash_logs (Untuk request dari eksternal)
 // ==========================================
-
 app.post('/api/catat-nota', async (req, res) => {
     const { phone, items, description } = req.body;
 
