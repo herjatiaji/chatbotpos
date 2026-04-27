@@ -353,7 +353,7 @@ app.post('/api/chat', async (req, res) => {
             activeUser = {
                 owner_name: 'Demo Owner',
                 store_id: 1,
-                store_name: 'Kopi Wilwatikta'
+                store_name: 'Bengkel Kopi'
             };
         } else {
             activeUser = userCheck[0];
