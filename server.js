@@ -547,6 +547,17 @@ ${conversationHistory || '(Tidak ada riwayat percakapan sebelumnya)'}
 Gunakan konteks di atas jika pertanyaan saat ini adalah follow-up (ada kata "itu", "tadi", "lalu bagaimana", "bandingkan").
 
 ============================
+SKEMA DATABASE (KOLOM PENTING - WAJIB PATUHI NAMA KOLOM INI)
+============================
+- transactions (id, store_id, total_amount, transaction_date, payment_method)
+- transaction_details (id, transaction_id, menu_item_id, qty, subtotal)  <-- INGAT: nama kolom adalah "qty", BUKAN "quantity"
+- menu_items (id, store_id, category_id, name, price)
+- menu_categories (id, store_id, name)
+- cash_logs (id, store_id, type, amount, description, created_at)
+- inventory (id, store_id, item_name, unit)
+- menu_recipes (id, menu_item_id, inventory_id, qty_used)
+
+============================
 PEMETAAN KATA KUNCI WAKTU
 ============================
 | Kata kunci user                               | Filter SQL                                                                                       |
@@ -562,21 +573,25 @@ PEMETAAN KATA KUNCI WAKTU
 | "total", "keseluruhan", "semua"               | TANPA filter tanggal                                                                             |
 
 NAMA BULAN: Jan=1 Feb=2 Mar=3 Apr=4 Mei=5 Jun=6 Jul=7 Agt=8 Sep=9 Okt=10 Nov=11 Des=12
+METODE PEMBAYARAN: tunai/cash → ILIKE '%cash%' | transfer/bank → ILIKE '%transfer%' | qris/digital/ewallet → ILIKE '%qris%'
 
-METODE PEMBAYARAN:
-tunai/cash → ILIKE '%cash%' | transfer/bank → ILIKE '%transfer%' | qris/digital/ewallet → ILIKE '%qris%'
+============================
+ALIAS WAJIB
+============================
+transactions→t | transaction_details→td | menu_items→mi | menu_categories→mc | inventory→inv | cash_logs→cl | menu_recipes→mr
 
 ============================
 ATURAN WAJIB (BACA DENGAN TELITI)
 ============================
 [1]  KEAMANAN: WAJIB store_id = ${storeId} pada: transactions, inventory, menu_items, menu_categories, cash_logs.
-[2]  ALIAS: transactions→t | transaction_details→td | menu_items→mi | menu_categories→mc | inventory→inv | cash_logs→cl | menu_recipes→mr
-[3]  NULL-SAFE: COALESCE(..., 0) pada semua agregat.
-[4]  LABA/RUGI: pendapatan=SUM(t.total_amount), pengeluaran=SUM(cl.amount) WHERE cl.type='out'.
-[5]  [PENTING] PENGELUARAN SPESIFIK: Jika user menanyakan "pengeluaran untuk X dan Y" (contoh: gaji, sewa, listrik), JANGAN gunakan SUM(). Kamu WAJIB menggunakan SELECT description, amount, created_at FROM cash_logs. 
-[6]  [PENTING] KATA KUNCI DASAR: Gunakan akar kata saja untuk ILIKE. Contoh: jika user tanya "gaji karyawan", gunakan ILIKE '%gaji%'. Jika tanya "sewa tempat", gunakan ILIKE '%sewa%'.
-[7]  [PENTING] Jika user meminta untuk mencatat pengeluaran, input nota, atau membayar sesuatu: DILARANG KERAS menggunakan query INSERT. Kamu WAJIB mengembalikan: SELECT 'PARSING_NOTA' AS status;
-[8]  [PENTING] CASTING TANGGAL: PostgreSQL wajib tahu tipe data tanggal. Jika menggunakan string tanggal spesifik di dalam fungsi, WAJIB tambahkan ::date. (Contoh BENAR: DATE_TRUNC('month', '2026-04-01'::date). Contoh SALAH: DATE_TRUNC('month', '2026-04-01')).
+[2]  JOIN TABLE: WAJIB gunakan JOIN yang benar (misal: JOIN transaction_details td ON t.id = td.transaction_id) jika menanyakan detail pesanan/menu. DILARANG query multi-tabel tanpa JOIN.
+[3]  KOLOM QTY: WAJIB gunakan td.qty. DILARANG KERAS menggunakan td.quantity.
+[4]  NULL-SAFE: COALESCE(..., 0) pada semua agregat (SUM, COUNT).
+[5]  LABA/RUGI: pendapatan=SUM(t.total_amount), pengeluaran=SUM(cl.amount) WHERE cl.type='out'.
+[6]  PENGELUARAN SPESIFIK: Jika user menanyakan "pengeluaran untuk X dan Y" (contoh: gaji, sewa, listrik), JANGAN gunakan SUM(). Kamu WAJIB menggunakan SELECT description, amount, created_at FROM cash_logs. 
+[7]  KATA KUNCI DASAR: Gunakan akar kata saja untuk ILIKE. Contoh: jika tanya "gaji karyawan", gunakan ILIKE '%gaji%'. Jika tanya kategori, gunakan mc.name ILIKE '%minuman%'.
+[8]  PARSING NOTA: Jika user meminta mencatat pengeluaran, input nota, atau membayar sesuatu: DILARANG KERAS menggunakan query INSERT. Kamu WAJIB mengembalikan HANYA: SELECT 'PARSING_NOTA' AS status;
+[9]  CASTING TANGGAL: PostgreSQL wajib tahu tipe data tanggal. Jika menggunakan string tanggal spesifik di dalam fungsi, WAJIB tambahkan ::date. (Contoh BENAR: DATE_TRUNC('month', '2026-04-01'::date)).
 
 ============================
 CONTOH QUERY (FEW-SHOT)
@@ -584,6 +599,9 @@ CONTOH QUERY (FEW-SHOT)
 
 Pertanyaan: "total pendapatan keseluruhan"
 SQL: SELECT COALESCE(SUM(t.total_amount),0) AS total_pendapatan, COUNT(t.id) AS total_transaksi FROM transactions t WHERE t.store_id = ${storeId};
+
+Pertanyaan: "apa menu minuman paling laku bulan ini?"
+SQL: SELECT mi.name AS nama_menu, COALESCE(SUM(td.qty),0) AS total_terjual FROM transaction_details td JOIN transactions t ON td.transaction_id = t.id JOIN menu_items mi ON td.menu_item_id = mi.id JOIN menu_categories mc ON mi.category_id = mc.id WHERE t.store_id = ${storeId} AND mc.store_id = ${storeId} AND DATE_TRUNC('month', t.transaction_date) = DATE_TRUNC('month', CURRENT_DATE) AND mc.name ILIKE '%minuman%' GROUP BY mi.name ORDER BY total_terjual DESC LIMIT 1;
 
 Pertanyaan: "berapa pengeluaran kita buat gaji dan sewa?"
 SQL: SELECT description, amount, created_at FROM cash_logs WHERE store_id = ${storeId} AND type = 'out' AND (description ILIKE '%gaji%' OR description ILIKE '%sewa%') ORDER BY created_at DESC;
