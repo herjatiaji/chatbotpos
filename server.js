@@ -483,7 +483,7 @@ ATURAN FORMAT (SANGAT PENTING - WAJIB DIIKUTI):
             });
         }
 
-        // ══════════════════════════════════════════════════════
+       // ══════════════════════════════════════════════════════
         // 🧠 FLOW UTAMA: SQL → DB → ANSWER
         // ══════════════════════════════════════════════════════
         const today = new Date().toISOString().split('T')[0];
@@ -513,60 +513,23 @@ PEMETAAN KATA KUNCI WAKTU
 | "bulan ini"                                   | DATE_TRUNC('month', t.transaction_date) = DATE_TRUNC('month', CURRENT_DATE)                      |
 | "bulan lalu"                                  | DATE_TRUNC('month', t.transaction_date) = DATE_TRUNC('month', CURRENT_DATE - INTERVAL '1 month') |
 | "tahun ini"                                   | DATE_TRUNC('year', t.transaction_date) = DATE_TRUNC('year', CURRENT_DATE)                        |
-| "tahun lalu"                                  | DATE_TRUNC('year', t.transaction_date) = DATE_TRUNC('year', CURRENT_DATE - INTERVAL '1 year')    |
-| "7 hari terakhir"                             | t.transaction_date >= CURRENT_DATE - INTERVAL '7 days'                                           |
-| "30 hari terakhir"                            | t.transaction_date >= CURRENT_DATE - INTERVAL '30 days'                                          |
 | "sekarang", "saat ini", "kini"                | DATE_TRUNC('month', ...) = DATE_TRUNC('month', CURRENT_DATE)  ← BULAN INI                        |
-| "total", "keseluruhan", "semua", "sepanjang"  | TANPA filter tanggal                                                                             |
-| "kuartal ini"                                 | EXTRACT(QUARTER FROM ...) = EXTRACT(QUARTER FROM CURRENT_DATE) AND EXTRACT(YEAR ...) = EXTRACT(YEAR FROM CURRENT_DATE) |
-| "kuartal lalu"                                | Gunakan CURRENT_DATE - INTERVAL '3 months'                                                       |
+| "total", "keseluruhan", "semua"               | TANPA filter tanggal                                                                             |
 
 NAMA BULAN: Jan=1 Feb=2 Mar=3 Apr=4 Mei=5 Jun=6 Jul=7 Agt=8 Sep=9 Okt=10 Nov=11 Des=12
-→ EXTRACT(MONTH FROM t.transaction_date) = [N] AND EXTRACT(YEAR FROM t.transaction_date) = EXTRACT(YEAR FROM CURRENT_DATE)
 
 METODE PEMBAYARAN:
 tunai/cash → ILIKE '%cash%' | transfer/bank → ILIKE '%transfer%' | qris/digital/ewallet → ILIKE '%qris%'
 
-ATURAN KRITIS:
-- "sekarang"/"saat ini" = BULAN INI, bukan hari ini.
-- "total"/"keseluruhan" = HAPUS semua filter tanggal.
-- DILARANG hardcode tahun/bulan. Pakai CURRENT_DATE atau EXTRACT().
-- cash_logs gunakan cl.created_at.
-
 ============================
-SKEMA DATABASE
-============================
-stores | menu_categories | menu_items | menu_recipes | inventory
-transactions | transaction_details | cash_logs | whatsapp_users
-
-============================
-ALIAS WAJIB
-============================
-transactions→t | transaction_details→td | menu_items→mi
-menu_categories→mc | inventory→inv | cash_logs→cl | menu_recipes→mr
-
-============================
-ATURAN WAJIB
+ATURAN WAJIB (BACA DENGAN TELITI)
 ============================
 [1]  KEAMANAN: WAJIB store_id = ${storeId} pada: transactions, inventory, menu_items, menu_categories, cash_logs.
-[2]  ALIAS: Gunakan alias wajib tanpa kecuali.
+[2]  ALIAS: transactions→t | transaction_details→td | menu_items→mi | menu_categories→mc | inventory→inv | cash_logs→cl | menu_recipes→mr
 [3]  NULL-SAFE: COALESCE(..., 0) pada semua agregat.
-[4]  NAMA KOLOM: Selalu deskriptif (AS total_omzet, AS nama_menu, dll.).
-[5]  ILIKE: DILARANG = untuk nama menu/kategori.
-[6]  MULTI-PERIODE: Gunakan CTE (WITH ... AS).
-[7]  LABA/RUGI: pendapatan=SUM(t.total_amount), pengeluaran=SUM(cl.amount) WHERE cl.type='out'.
-[8]  BAHAN TERPAKAI: SUM(td.qty * mr.qty_used) GROUP BY inv.item_name.
-[9]  HARI: EXTRACT(DOW). 0=Minggu, 6=Sabtu.
-[10] DIVISI NOL: CASE WHEN denominator=0 THEN NULL ELSE ROUND(n/d,2) END.
-[11] RANKING: DENSE_RANK() OVER (ORDER BY ... DESC).
-[12] MENU TIDAK TERJUAL: LEFT JOIN + WHERE td.id IS NULL.
-[13] MULTI-KEYWORD: mi.name ILIKE '%a%' OR mi.name ILIKE '%b%'.
-[14] FILTER NOMINAL: t.total_amount > [nilai].
-[15] PER MEJA: t.table_number.
-[16] RATA-RATA HARIAN: SUM / COUNT(DISTINCT t.transaction_date::date).
-[17] KONTRIBUSI (%): Gunakan CTE atau subquery.
-[18] FOLLOW-UP: Gunakan konteks percakapan jika ada kata "itu", "tadi", "lalu", "bandingkan".
-[19] NOTES: Jangan sertakan kecuali diminta.
+[4]  LABA/RUGI: pendapatan=SUM(t.total_amount), pengeluaran=SUM(cl.amount) WHERE cl.type='out'.
+[5]  [PENTING] PENGELUARAN SPESIFIK: Jika user menanyakan "pengeluaran untuk X dan Y" (contoh: gaji, sewa, listrik), JANGAN gunakan SUM(). Kamu WAJIB menggunakan SELECT description, amount, created_at FROM cash_logs. 
+[6]  [PENTING] KATA KUNCI DASAR: Gunakan akar kata saja untuk ILIKE. Contoh: jika user tanya "gaji karyawan", gunakan ILIKE '%gaji%'. Jika tanya "sewa tempat", gunakan ILIKE '%sewa%'.
 
 ============================
 CONTOH QUERY (FEW-SHOT)
@@ -575,26 +538,11 @@ CONTOH QUERY (FEW-SHOT)
 Pertanyaan: "total pendapatan keseluruhan"
 SQL: SELECT COALESCE(SUM(t.total_amount),0) AS total_pendapatan, COUNT(t.id) AS total_transaksi FROM transactions t WHERE t.store_id = ${storeId};
 
-Pertanyaan: "total pendapatan sekarang"
-SQL: SELECT COALESCE(SUM(t.total_amount),0) AS total_pendapatan, COUNT(t.id) AS total_transaksi FROM transactions t WHERE t.store_id = ${storeId} AND DATE_TRUNC('month', t.transaction_date) = DATE_TRUNC('month', CURRENT_DATE);
-
-Pertanyaan: "total pendapatan hari ini"
-SQL: SELECT COALESCE(SUM(t.total_amount),0) AS total_pendapatan, COUNT(t.id) AS total_transaksi FROM transactions t WHERE t.store_id = ${storeId} AND t.transaction_date::date = CURRENT_DATE;
-
 Pertanyaan: "5 menu terlaris bulan ini"
 SQL: SELECT mi.name AS nama_menu, COALESCE(SUM(td.qty),0) AS total_porsi, COALESCE(SUM(td.subtotal),0) AS total_pendapatan FROM transaction_details td JOIN transactions t ON td.transaction_id = t.id JOIN menu_items mi ON td.menu_item_id = mi.id WHERE t.store_id = ${storeId} AND DATE_TRUNC('month', t.transaction_date) = DATE_TRUNC('month', CURRENT_DATE) GROUP BY mi.name ORDER BY total_porsi DESC LIMIT 5;
 
-Pertanyaan: "omzet minggu ini vs minggu lalu"
-SQL: WITH minggu_ini AS (SELECT COALESCE(SUM(t.total_amount),0) AS omzet FROM transactions t WHERE t.store_id = ${storeId} AND DATE_TRUNC('week', t.transaction_date) = DATE_TRUNC('week', CURRENT_DATE)), minggu_lalu AS (SELECT COALESCE(SUM(t.total_amount),0) AS omzet FROM transactions t WHERE t.store_id = ${storeId} AND DATE_TRUNC('week', t.transaction_date) = DATE_TRUNC('week', CURRENT_DATE - INTERVAL '1 week')) SELECT a.omzet AS omzet_minggu_ini, b.omzet AS omzet_minggu_lalu, (a.omzet - b.omzet) AS selisih, CASE WHEN b.omzet = 0 THEN NULL ELSE ROUND(((a.omzet - b.omzet) / b.omzet * 100)::numeric, 2) END AS persentase_perubahan FROM minggu_ini a, minggu_lalu b;
-
-Pertanyaan: "rekap laba rugi bulan ini"
-SQL: WITH pendapatan AS (SELECT COALESCE(SUM(t.total_amount),0) AS total FROM transactions t WHERE t.store_id = ${storeId} AND DATE_TRUNC('month', t.transaction_date) = DATE_TRUNC('month', CURRENT_DATE)), pengeluaran AS (SELECT COALESCE(SUM(cl.amount),0) AS total FROM cash_logs cl WHERE cl.store_id = ${storeId} AND cl.type = 'out' AND DATE_TRUNC('month', cl.created_at) = DATE_TRUNC('month', CURRENT_DATE)) SELECT p.total AS total_pendapatan, k.total AS total_pengeluaran, (p.total - k.total) AS laba_bersih FROM pendapatan p, pengeluaran k;
-
-Pertanyaan: "menu yang belum pernah terjual bulan ini"
-SQL: SELECT mi.name AS nama_menu, mi.price AS harga FROM menu_items mi LEFT JOIN (SELECT td.menu_item_id FROM transaction_details td JOIN transactions t ON td.transaction_id = t.id WHERE t.store_id = ${storeId} AND DATE_TRUNC('month', t.transaction_date) = DATE_TRUNC('month', CURRENT_DATE)) sold ON mi.id = sold.menu_item_id WHERE mi.store_id = ${storeId} AND sold.menu_item_id IS NULL ORDER BY mi.name;
-
-Pertanyaan: "estimasi bahan terpakai bulan ini"
-SQL: SELECT inv.item_name AS bahan_baku, inv.unit, COALESCE(SUM(td.qty * mr.qty_used),0) AS estimasi_terpakai FROM transaction_details td JOIN transactions t ON td.transaction_id = t.id JOIN menu_items mi ON td.menu_item_id = mi.id JOIN menu_recipes mr ON mr.menu_item_id = mi.id JOIN inventory inv ON inv.id = mr.inventory_id WHERE t.store_id = ${storeId} AND inv.store_id = ${storeId} AND DATE_TRUNC('month', t.transaction_date) = DATE_TRUNC('month', CURRENT_DATE) GROUP BY inv.item_name, inv.unit ORDER BY estimasi_terpakai DESC;
+Pertanyaan: "berapa pengeluaran kita buat gaji dan sewa?"
+SQL: SELECT description, amount, created_at FROM cash_logs WHERE store_id = ${storeId} AND type = 'out' AND (description ILIKE '%gaji%' OR description ILIKE '%sewa%') ORDER BY created_at DESC;
 
 ============================
 FORMAT OUTPUT
@@ -621,10 +569,10 @@ FORMAT OUTPUT
 
         const dbResult = await sql.unsafe(sqlQuery);
 
-        const safeData = dbResult.length > 15 ? dbResult.slice(0, 15) : dbResult;
+        const safeData = dbResult.length > 20 ? dbResult.slice(0, 20) : dbResult;
         let dataToAI = JSON.stringify(safeData);
-        if (dbResult.length > 15) {
-            dataToAI += `\n(Catatan: Ditampilkan 15 data teratas dari total ${dbResult.length} baris.)`;
+        if (dbResult.length > 20) {
+            dataToAI += `\n(Catatan: Ditampilkan 20 data teratas dari total ${dbResult.length} baris.)`;
         }
 
         // Inject konteks rentang data jika kosong
@@ -635,7 +583,7 @@ FORMAT OUTPUT
         if (isEmptyOrZero) {
             const range = await getDataRange(storeId);
             if (range?.total_transaksi > 0) {
-                dataRangeContext = `\nINFO: Database memiliki ${range.total_transaksi} transaksi dari ${range.tanggal_pertama} hingga ${range.tanggal_terakhir}. Periode yang ditanyakan kemungkinan belum ada transaksinya.`;
+                dataRangeContext = `\nINFO: Database memiliki ${range.total_transaksi} transaksi dari ${range.tanggal_pertama} hingga ${range.tanggal_terakhir}. Kemungkinan kata kunci tidak ditemukan atau belum ada transaksi di periode ini.`;
             }
         }
 
@@ -645,29 +593,23 @@ FORMAT OUTPUT
 WAJIB: Seluruh jawaban dalam Bahasa Indonesia. DILARANG menggunakan Bahasa Inggris dalam jawaban akhir.
 
 Kamu adalah Kazeer, bot AI Business Consultant untuk ${storeName}.
-Kamu pintar, informatif, dan selalu memberikan insight bisnis yang valuable — seperti ChatGPT tapi khusus untuk bisnis cafe/resto.
 
 Pertanyaan: "${message}"
 Data dari database: ${dataToAI}${dataRangeContext}
 
-Riwayat percakapan:
-${conversationHistory || '(Tidak ada riwayat)'}
-
 CARA MENJAWAB (WAJIB DIIKUTI):
 1. Setiap poin diawali emoji yang relevan, diikuti teks langsung
 2. JAWABAN HARUS RAPI! WAJIB berikan ENTER (baris kosong ganda / line break) di antara setiap poin/paragraf.
-3. Maksimal 2-3 kalimat per poin — jangan wall of text
+3. [PENTING] JIKA MENDAPATKAN RINCIAN PENGELUARAN (description & amount): Kamu wajib menjumlahkannya sendiri secara matematis dan tampilkan TOTAL keseluruhannya. Lalu, berikan juga breakdown/rinciannya dari mana uang tersebut terpakai agar owner tahu detailnya.
 4. Selalu akhiri dengan 1 insight bisnis yang actionable dan spesifik
-5. Bahasa Indonesia yang profesional tapi tetap ramah
-6. Format Rupiah: Rp 1.250.000 | Persentase: 23,5%
-7. Untuk daftar atau ranking: gunakan angka (1. 2. 3.) bukan bullet
-8. Jika data kosong: jelaskan dengan sopan + sebutkan rentang data yang tersedia
+5. Bahasa Indonesia yang profesional tapi santai. Gunakan sebutan "Bos" untuk menyapa user.
+6. Format Rupiah: Rp 1.250.000
+7. Untuk daftar: gunakan angka (1. 2. 3.) bukan bullet.
 
 DILARANG KERAS:
 - DILARANG menggunakan tanda bintang (*) atau markdown bold dalam jawaban.
-- DILARANG menggunakan bullet • — gunakan angka (1. 2. 3.).
-- Menampilkan JSON, kode teknis, atau simbol programming.
-- Mengarang angka yang tidak ada di data.`;
+- DILARANG menggunakan bullet •.
+- DILARANG Menampilkan JSON mentah.`;
 
         const finalAnswer = await callAI(promptToSummary, true);
         updateSession(phone, message, finalAnswer);
@@ -688,6 +630,7 @@ DILARANG KERAS:
 // ==========================================
 // ENDPOINT: Simpan hasil parsing nota ke cash_logs
 // ==========================================
+
 app.post('/api/catat-nota', async (req, res) => {
     const { phone, items, description } = req.body;
 
