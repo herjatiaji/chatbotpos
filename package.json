@@ -4,7 +4,7 @@
   "main": "index.js",
   "type": "module",
   "scripts": {
-    "start": "node server.js",
+    "start": "concurrently \"node server.js\" \"node telegram.js\"",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [],
@@ -12,8 +12,10 @@
   "license": "ISC",
   "description": "",
   "dependencies": {
+    "concurrently": "^9.2.1",
     "dotenv": "^17.4.2",
     "express": "^5.2.1",
+    "node-telegram-bot-api": "^0.67.0",
     "openai": "^6.34.0",
     "postgres": "^3.4.9"
   }
