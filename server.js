@@ -339,18 +339,26 @@ app.post('/api/chat', async (req, res) => {
     try {
         console.log(`\n💬 [${phone}] "${message}"`);
 
-        const userCheck = await sql`
+       const userCheck = await sql`
             SELECT u.owner_name, u.store_id, s.store_name 
             FROM whatsapp_users u 
             JOIN stores s ON u.store_id = s.id 
             WHERE u.phone_number = ${phone}
         `;
 
+        // 🔥 MODE DEMO: Bypas Pengecekan User 🔥
+        let activeUser;
         if (userCheck.length === 0) {
-            return res.status(403).json({ success: false, answer: "Mohon maaf, nomor Anda tidak terdaftar dalam sistem Kazeer AI." });
+            console.log(`   [Demo Mode] ID ${phone} tidak terdaftar. Otomatis masuk ke Store 1.`);
+            activeUser = {
+                owner_name: 'Demo Owner',
+                store_id: 1,
+                store_name: 'Kopi Wilwatikta'
+            };
+        } else {
+            activeUser = userCheck[0];
         }
 
-        const activeUser = userCheck[0];
         const storeId = activeUser.store_id;
         const storeName = activeUser.store_name;
 
@@ -688,9 +696,9 @@ app.post('/api/catat-nota', async (req, res) => {
         const userCheck = await sql`
             SELECT u.store_id FROM whatsapp_users u WHERE u.phone_number = ${phone}
         `;
-        if (userCheck.length === 0) return res.status(403).json({ success: false });
-
-        const storeId = userCheck[0].store_id;
+        
+        // 🔥 MODE DEMO: Default ke Store ID 1 🔥
+        const storeId = userCheck.length === 0 ? 1 : userCheck[0].store_id;
         const total = items.reduce((sum, i) => sum + (i.subtotal || 0), 0);
 
         await sql`
