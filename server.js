@@ -34,7 +34,6 @@ const SESSION_TTL = 30 * 60 * 1000;
 
 function getSession(phone) {
     const session = sessionStore.get(phone);
-    // Tambahkan pendingNota untuk menampung data sebelum konfirmasi
     if (!session) return { history: [], lastActive: Date.now(), pendingNota: null };
     if (Date.now() - session.lastActive > SESSION_TTL) {
         sessionStore.delete(phone);
@@ -77,7 +76,6 @@ function validateSQL(sqlQuery, storeId) {
     if (!/^\s*(?:WITH\s+\w|SELECT\s)/i.test(sqlQuery)) {
         throw new Error('SQL tidak aman: hanya SELECT atau CTE yang diizinkan.');
     }
-    // Izinkan bypass jika statusnya PARSING_NOTA
     const isFallback = sqlQuery.includes('PERTANYAAN_TIDAK_VALID') || sqlQuery.includes('PARSING_NOTA');
     const storeIdPattern = new RegExp(`store_id\\s*=\\s*${storeId}(?!\\d)`);
     if (!storeIdPattern.test(sqlQuery) && !isFallback) {
@@ -200,7 +198,6 @@ function isChitchat(message) {
 // ==========================================
 function isNota(message) {
     const msg = message.toLowerCase();
-    // Lebih sensitif: langsung tangkap jika ada niat mencatat pengeluaran
     if (msg.includes('nota') || msg.includes('struk') || msg.includes('catat')) return true;
     if ((msg.includes('beli') || msg.includes('bayar')) && /\d/.test(msg)) return true;
     
@@ -369,7 +366,7 @@ app.post('/api/chat', async (req, res) => {
         if (isChitchat(message)) {
             return res.json({
                 success: true,
-                answer: `🤖 Kazeer AI\n\nHalo! Saya adalah Kazeer, bot AI Business Consultant kamu untuk ${storeName}.\n\n💡 Saya bisa membantu kamu dengan:\n1. 📊 Analisis omzet & transaksi\n2. 🏆 Menu terlaris & performa penjualan\n3. 📦 Stok & bahan baku\n4. 💰 Laporan laba rugi\n5. 🧾 Baca & analisis nota belanja\n6. 📈 Hitung HPP & margin keuntungan\n\nSilakan ajukan pertanyaan bisnis kamu! 🚀`,
+                answer: `🤖 Kazeer AI\n\nHalo Owner! Saya adalah Kazeer, bot AI Business Consultant untuk ${storeName}.\n\n💡 Saya bisa membantu dengan:\n1. 📊 Analisis omzet & transaksi\n2. 🏆 Menu terlaris & performa penjualan\n3. 📦 Stok & bahan baku\n4. 💰 Laporan laba rugi\n5. 🧾 Baca & analisis nota belanja\n6. 📈 Hitung HPP & margin keuntungan\n\nSilakan ajukan pertanyaan bisnis Anda! 🚀`,
                 sql: null,
                 rawData: []
             });
@@ -389,13 +386,12 @@ app.post('/api/chat', async (req, res) => {
                 VALUES (${storeId}, 'out', ${total}, ${description}, NOW())
             `;
 
-            // Reset pendingNota setelah berhasil
             session.pendingNota = null;
             sessionStore.set(phone, session);
 
             return res.json({
                 success: true,
-                answer: `✅ Siap Bos! Pengeluaran sebesar Rp ${total.toLocaleString('id-ID')} sudah berhasil dicatat ke laporan keuangan ${storeName}.\n\nAda lagi yang bisa Kazeer bantu? 🚀`,
+                answer: `✅ Siap Owner! Pengeluaran sebesar Rp ${total.toLocaleString('id-ID')} sudah berhasil dicatat ke laporan keuangan ${storeName}.\n\nAda lagi yang bisa Kazeer bantu? 🚀`,
                 sql: null,
                 rawData: []
             });
@@ -406,7 +402,7 @@ app.post('/api/chat', async (req, res) => {
             sessionStore.set(phone, session);
             return res.json({ 
                 success: true, 
-                answer: "Oke Bos, pencatatan nota dibatalkan. 👌", 
+                answer: "Oke Owner, pencatatan nota dibatalkan. 👌", 
                 sql: null, 
                 rawData: [] 
             });
@@ -426,7 +422,7 @@ app.post('/api/chat', async (req, res) => {
             if (items.length === 0) {
                 return res.json({
                     success: true,
-                    answer: "⚠️ Maaf Bos, Kazeer nggak berhasil baca detail itemnya. Coba ketik yang lebih jelas ya!\n\nContoh:\nnota: beli sabun cuci 15rb",
+                    answer: "⚠️ Maaf Owner, Kazeer belum berhasil membaca detail itemnya. Boleh coba ketik dengan format yang lebih jelas?\n\nContoh:\nnota: beli sabun cuci 15rb",
                     sql: null,
                     rawData: []
                 });
@@ -435,7 +431,6 @@ app.post('/api/chat', async (req, res) => {
             const totalNota = items.reduce((sum, i) => sum + (i.subtotal || 0), 0);
             const itemDescription = items.map(i => `${i.nama_item} (${i.qty})`).join(', ');
 
-            // Simpan ke state untuk konfirmasi selanjutnya
             session.pendingNota = {
                 items: items,
                 total: totalNota,
@@ -447,7 +442,7 @@ app.post('/api/chat', async (req, res) => {
 WAJIB: Seluruh jawaban dalam Bahasa Indonesia. DILARANG menggunakan Bahasa Inggris.
 
 Kamu adalah Kazeer, bot AI Business Consultant yang profesional.
-Kamu baru saja membaca nota belanja dari ${storeName}.
+Kamu baru saja membaca nota belanja dari Owner ${storeName}.
 
 Data item yang berhasil diekstrak:
 ${JSON.stringify(items, null, 2)}
@@ -459,7 +454,7 @@ Tugas kamu:
 2. Tampilkan total belanja
 3. Kelompokkan per kategori (bahan_baku, operasional, dll)
 4. Berikan 1-2 insight bisnis singkat (apakah pengeluaran ini wajar? ada yang perlu diperhatikan?)
-5. TANYAKAN DENGAN JELAS: "Apakah data ini sudah benar Bos? Balas SIMPAN untuk mencatat ke kas, atau BATAL."
+5. TANYAKAN DENGAN JELAS: "Apakah data ini sudah benar, Owner? Balas SIMPAN untuk mencatat ke kas, atau BATAL."
 
 Format jawaban: gunakan paragraf pendek, emoji yang relevan, dan poin-poin singkat (Gunakan angka 1, 2, 3, BUKAN bullet).
 WAJIB berikan jarak baris ganda (enter) antar paragraf/poin.
@@ -490,7 +485,7 @@ JANGAN tampilkan JSON mentah.`;
 WAJIB: Seluruh jawaban dalam Bahasa Indonesia. DILARANG menggunakan Bahasa Inggris.
 
 Kamu adalah Kazeer, bot AI Business Consultant untuk ${storeName}.
-Pertanyaan owner: "${message}"
+Pertanyaan Owner: "${message}"
 
 Berikut data resep dan referensi harga bahan dari database:
 ${JSON.stringify(hppData, null, 2)}
@@ -581,9 +576,6 @@ CONTOH QUERY (FEW-SHOT)
 Pertanyaan: "total pendapatan keseluruhan"
 SQL: SELECT COALESCE(SUM(t.total_amount),0) AS total_pendapatan, COUNT(t.id) AS total_transaksi FROM transactions t WHERE t.store_id = ${storeId};
 
-Pertanyaan: "5 menu terlaris bulan ini"
-SQL: SELECT mi.name AS nama_menu, COALESCE(SUM(td.qty),0) AS total_porsi, COALESCE(SUM(td.subtotal),0) AS total_pendapatan FROM transaction_details td JOIN transactions t ON td.transaction_id = t.id JOIN menu_items mi ON td.menu_item_id = mi.id WHERE t.store_id = ${storeId} AND DATE_TRUNC('month', t.transaction_date) = DATE_TRUNC('month', CURRENT_DATE) GROUP BY mi.name ORDER BY total_porsi DESC LIMIT 5;
-
 Pertanyaan: "berapa pengeluaran kita buat gaji dan sewa?"
 SQL: SELECT description, amount, created_at FROM cash_logs WHERE store_id = ${storeId} AND type = 'out' AND (description ILIKE '%gaji%' OR description ILIKE '%sewa%') ORDER BY created_at DESC;
 
@@ -602,11 +594,10 @@ FORMAT OUTPUT
         validateSQL(sqlQuery, storeId);
         console.log("   [💻 Execute SQL]:", sqlQuery);
 
-        // Perangkap jika AI mencoba mem-parsing nota tapi lolos dari deteksi isNota
         if (sqlQuery.includes('PARSING_NOTA')) {
             return res.json({
                 success: true,
-                answer: "🧾 Wah, ini sepertinya rincian belanja ya Bos? Biar sistem bisa otomatis merekap dan menjumlahkannya, tolong tambahkan kata **nota:** di awal pesanmu ya! \n\nContoh: *nota: beli sabun 15rb*",
+                answer: "🧾 Wah, ini sepertinya rincian belanja ya Owner? Biar sistem bisa otomatis merekap dan menjumlahkannya, tolong tambahkan kata **nota:** di awal pesan ya! \n\nContoh: *nota: beli sabun 15rb*",
                 sql: sqlQuery, rawData: []
             });
         }
@@ -627,7 +618,6 @@ FORMAT OUTPUT
             dataToAI += `\n(Catatan: Ditampilkan 20 data teratas dari total ${dbResult.length} baris.)`;
         }
 
-        // Inject konteks rentang data jika kosong
         let dataRangeContext = '';
         const isEmptyOrZero = safeData.length === 0 ||
             safeData.every(row => Object.values(row).every(v => v === null || v === 0 || v === '0'));
@@ -646,7 +636,7 @@ WAJIB: Seluruh jawaban dalam Bahasa Indonesia. DILARANG menggunakan Bahasa Inggr
 
 Kamu adalah Kazeer, bot AI Business Consultant untuk ${storeName}.
 
-Pertanyaan: "${message}"
+Pertanyaan Owner: "${message}"
 Data dari database: ${dataToAI}${dataRangeContext}
 
 CARA MENJAWAB (WAJIB DIIKUTI):
@@ -654,7 +644,7 @@ CARA MENJAWAB (WAJIB DIIKUTI):
 2. JAWABAN HARUS RAPI! WAJIB berikan ENTER (baris kosong ganda / line break) di antara setiap poin/paragraf.
 3. [PENTING] JIKA MENDAPATKAN RINCIAN PENGELUARAN (description & amount): Kamu wajib menjumlahkannya sendiri secara matematis dan tampilkan TOTAL keseluruhannya. Lalu, berikan juga breakdown/rinciannya dari mana uang tersebut terpakai agar owner tahu detailnya.
 4. Selalu akhiri dengan 1 insight bisnis yang actionable dan spesifik
-5. Bahasa Indonesia yang profesional tapi santai. Gunakan sebutan "Bos" untuk menyapa user.
+5. Bahasa Indonesia yang profesional tapi santai. Gunakan sebutan "Owner" atau "Pemilik" untuk menyapa user. DILARANG menggunakan kata "Bos".
 6. Format Rupiah: Rp 1.250.000
 7. Untuk daftar: gunakan angka (1. 2. 3.) bukan bullet.
 
@@ -673,14 +663,14 @@ DILARANG KERAS:
         console.error("❌ Error:", error.message);
         res.status(500).json({
             success: false,
-            answer: "⚠️ Maaf, terjadi kendala teknis saat memproses permintaan kamu.\n\nSilakan coba beberapa saat lagi. 🙏",
+            answer: "⚠️ Maaf, terjadi kendala teknis saat memproses permintaan.\n\nSilakan coba beberapa saat lagi. 🙏",
             error: error.message
         });
     }
 });
 
 // ==========================================
-// ENDPOINT: Simpan hasil parsing nota ke cash_logs (Untuk request dari eksternal)
+// ENDPOINT: Simpan hasil parsing nota ke cash_logs
 // ==========================================
 app.post('/api/catat-nota', async (req, res) => {
     const { phone, items, description } = req.body;
