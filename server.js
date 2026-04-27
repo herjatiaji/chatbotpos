@@ -252,54 +252,71 @@ function isHPPQuestion(message) {
 
 // ==========================================
 // HPP CALCULATOR: Hitung HPP & margin per menu
+// Mengambil data nyata dari DB: resep, harga jual, dan
+// referensi harga bahan dari cash_logs (jika tersedia)
 // ==========================================
 async function hitungHPP(storeId, menuKeyword = null) {
-    // Ambil data harga bahan baku dari inventory + recipes
-    let hppQuery;
-    if (menuKeyword) {
-        hppQuery = await sql.unsafe(`
-            SELECT 
-                mi.name AS nama_menu,
-                mi.price AS harga_jual,
-                SUM(mr.qty_used * (
-                    SELECT COALESCE(AVG(cl.amount / NULLIF(cl.amount, 0)), 0)
-                    FROM cash_logs cl 
-                    WHERE cl.store_id = ${storeId} 
-                    AND cl.type = 'out'
-                    AND cl.description ILIKE '%' || inv.item_name || '%'
-                    LIMIT 1
-                )) AS estimasi_hpp_raw,
-                json_agg(json_build_object(
-                    'bahan', inv.item_name,
-                    'qty_used', mr.qty_used,
-                    'unit', inv.unit
-                )) AS komposisi
-            FROM menu_items mi
-            JOIN menu_recipes mr ON mr.menu_item_id = mi.id
-            JOIN inventory inv ON inv.id = mr.inventory_id
-            WHERE mi.store_id = ${storeId}
-            AND mi.name ILIKE '%${menuKeyword}%'
-            GROUP BY mi.name, mi.price
-        `);
-    } else {
-        hppQuery = await sql.unsafe(`
-            SELECT 
-                mi.name AS nama_menu,
-                mi.price AS harga_jual,
-                json_agg(json_build_object(
-                    'bahan', inv.item_name,
-                    'qty_used', mr.qty_used,
-                    'unit', inv.unit
-                )) AS komposisi
-            FROM menu_items mi
-            JOIN menu_recipes mr ON mr.menu_item_id = mi.id
-            JOIN inventory inv ON inv.id = mr.inventory_id
-            WHERE mi.store_id = ${storeId}
-            GROUP BY mi.name, mi.price
-            ORDER BY mi.name
-        `);
+    // Query 1: Resep + harga jual per menu
+    const menuFilter = menuKeyword ? `AND mi.name ILIKE '%${menuKeyword}%'` : '';
+    const resepData = await sql.unsafe(`
+        SELECT
+            mi.id       AS menu_id,
+            mi.name     AS nama_menu,
+            mi.price    AS harga_jual,
+            inv.item_name AS bahan,
+            inv.unit,
+            mr.qty_used
+        FROM menu_items mi
+        JOIN menu_recipes mr ON mr.menu_item_id = mi.id
+        JOIN inventory inv   ON inv.id = mr.inventory_id
+        WHERE mi.store_id = ${storeId}
+        ${menuFilter}
+        ORDER BY mi.name, inv.item_name
+    `);
+
+    // Query 2: Referensi harga bahan dari cash_logs
+    // Cari pengeluaran yang deskripsinya mengandung nama bahan
+    const hargaRef = await sql.unsafe(`
+        SELECT
+            inv.item_name,
+            inv.unit,
+            cl.amount       AS total_bayar,
+            cl.description  AS keterangan,
+            cl.created_at   AS tanggal_beli
+        FROM cash_logs cl
+        JOIN inventory inv ON cl.description ILIKE '%' || inv.item_name || '%'
+        WHERE cl.store_id = ${storeId}
+        AND cl.type = 'out'
+        ORDER BY cl.created_at DESC
+    `);
+
+    // Susun struktur: per menu → list bahan + referensi harga
+    const menuMap = {};
+    for (const row of resepData) {
+        if (!menuMap[row.nama_menu]) {
+            menuMap[row.nama_menu] = {
+                nama_menu: row.nama_menu,
+                harga_jual: Number(row.harga_jual),
+                bahan: []
+            };
+        }
+        // Cari referensi harga dari cash_logs
+        const ref = hargaRef.filter(h => h.item_name === row.bahan);
+        menuMap[row.nama_menu].bahan.push({
+            nama: row.bahan,
+            qty_used: Number(row.qty_used),
+            unit: row.unit,
+            referensi_harga_dari_cashlog: ref.length > 0
+                ? ref.slice(0, 2).map(r => ({
+                    total_bayar: Number(r.total_bayar),
+                    keterangan: r.keterangan,
+                    tanggal: r.tanggal_beli
+                  }))
+                : null
+        });
     }
-    return hppQuery;
+
+    return Object.values(menuMap);
 }
 
 // ==========================================
@@ -421,31 +438,34 @@ JANGAN tampilkan JSON mentah.`;
             const hppPrompt = `
 WAJIB: Seluruh jawaban dalam Bahasa Indonesia. DILARANG menggunakan Bahasa Inggris.
 
-Kamu adalah Kazeer, bot AI Business Consultant yang ahli dalam analisis bisnis cafe/restoran.
-Kamu sedang membantu owner ${storeName} menghitung HPP (Harga Pokok Penjualan) dan margin keuntungan.
-
+Kamu adalah Kazeer, bot AI Business Consultant untuk ${storeName}.
 Pertanyaan owner: "${message}"
 
-Data resep & harga jual dari database:
+Berikut data NYATA dari database — resep menu beserta referensi harga bahan dari catatan pembelian (cash_logs):
 ${JSON.stringify(hppData, null, 2)}
 
-TUGAS KAMU (gunakan kemampuan reasoning penuh):
-1. 🧮 Estimasi HPP per menu berdasarkan komposisi bahan yang ada
-   - Jika data harga bahan tidak tersedia di DB, gunakan estimasi harga pasar yang wajar untuk bahan tersebut
-   - Sebutkan asumsi harga yang kamu gunakan secara transparan
-2. 💰 Hitung margin kotor: ((Harga Jual - HPP) / Harga Jual) × 100%
-3. 📊 Kategorikan margin: Rendah (<30%), Sedang (30-60%), Tinggi (>60%)
-4. 🏆 Rekomendasikan menu mana yang paling menguntungkan
-5. ⚠️ Flagging menu dengan margin terlalu rendah — perlu evaluasi harga jual atau efisiensi bahan
-6. 💡 Berikan 2-3 rekomendasi bisnis yang actionable
+CARA MENGHITUNG HPP:
+Untuk setiap bahan dalam menu:
+- Jika "referensi_harga_dari_cashlog" tersedia → gunakan total_bayar dari sana sebagai referensi harga beli
+- Jika "referensi_harga_dari_cashlog" = null → JANGAN mengarang harga. Tulis: "harga [nama bahan] tidak ditemukan di catatan pembelian"
+- HPP per bahan = (qty_used / total_qty_beli) × total_bayar — estimasikan berdasarkan proporsi qty_used
 
-FORMAT JAWABAN:
-- Gunakan paragraf pendek per poin, bukan wall of text
-- Gunakan emoji yang relevan di setiap poin
-- Format angka ke Rupiah (Rp 15.000)
-- Format persentase dengan simbol % (45,5%)
-- Bahasa Indonesia yang profesional dan mudah dipahami
-- Di akhir, tambahkan disclaimer singkat bahwa HPP ini adalah estimasi berdasarkan data yang tersedia`;
+TUGAS (gunakan data di atas, JANGAN berasumsi di luar data):
+1. 🧮 Hitung HPP per menu berdasarkan data referensi harga yang tersedia
+2. 💰 Hitung margin kotor: ((harga_jual - HPP) / harga_jual) × 100%
+3. 📊 Kategorikan: Rendah < 30%, Sedang 30–60%, Tinggi > 60%
+4. 🏆 Sebutkan menu paling menguntungkan berdasarkan data
+5. ⚠️ Flagging menu margin rendah atau bahan yang harganya tidak tercatat
+6. 💡 Berikan 2–3 rekomendasi bisnis yang spesifik dan actionable
+
+ATURAN FORMAT (WAJIB DIIKUTI):
+- DILARANG menggunakan tanda bintang (*) atau markdown bold (**teks**) dalam jawaban
+- DILARANG menggunakan bullet • — gunakan angka (1. 2. 3.) atau baris baru saja
+- Setiap poin diawali emoji, diikuti teks langsung tanpa tanda baca dekoratif
+- Pisahkan setiap poin dengan satu baris kosong
+- Format Rupiah: Rp 15.000 | Persentase: 45,5%
+- Jika ada bahan tanpa referensi harga, sebutkan dengan jelas di output
+- Jangan tampilkan JSON mentah`;
 
             const hppAnswer = await callNemotron(hppPrompt, true); // thinking ON
             updateSession(phone, message, hppAnswer);
@@ -630,18 +650,21 @@ Riwayat percakapan:
 ${conversationHistory || '(Tidak ada riwayat)'}
 
 CARA MENJAWAB:
-1. 📝 Gunakan paragraf PENDEK — maksimal 2-3 kalimat per poin, lalu beri baris kosong (break)
-2. 🎯 Setiap poin baru = baris baru dengan emoji yang relevan di depannya
-3. 📊 Jika ada data angka, tampilkan dalam format poin-poin yang rapi
-4. 💡 Selalu akhiri dengan 1 insight bisnis yang actionable dan spesifik
-5. ✅ Bahasa Indonesia yang profesional tapi tetap ramah — bukan kaku seperti surat resmi
-6. 💰 Format Rupiah: Rp 1.250.000 | Persentase: 23,5%
-7. ❌ DILARANG: tampilkan JSON, kode teknis, atau simbol programming
-8. ❌ DILARANG: mengarang angka yang tidak ada di data
-9. 📋 Untuk daftar/ranking: gunakan nomor urut (1. 2. 3.) bukan bullet biasa
-10. 🔄 Jika data kosong: jelaskan dengan sopan + sebutkan rentang data yang tersedia (dari INFO jika ada)
-11. 📈 Jika ada persentase naik/turun: jelaskan artinya dalam konteks bisnis
-12. 🤔 Jika pertanyaan adalah follow-up: jawab dengan mengacu konteks sebelumnya secara natural`;
+1. Setiap poin diawali emoji yang relevan, diikuti teks langsung
+2. Pisahkan setiap poin dengan satu baris kosong agar mudah dibaca
+3. Maksimal 2-3 kalimat per poin — jangan wall of text
+4. Selalu akhiri dengan 1 insight bisnis yang actionable dan spesifik
+5. Bahasa Indonesia yang profesional tapi tetap ramah
+6. Format Rupiah: Rp 1.250.000 | Persentase: 23,5%
+7. Untuk daftar atau ranking: gunakan angka (1. 2. 3.) bukan bullet
+8. Jika data kosong: jelaskan dengan sopan + sebutkan rentang data yang tersedia
+9. Jika ada persentase naik/turun: jelaskan artinya dalam konteks bisnis
+10. Jika pertanyaan adalah follow-up: jawab mengacu konteks sebelumnya
+
+DILARANG KERAS:
+- Menggunakan tanda bintang (*) atau markdown bold (**teks**) dalam jawaban
+- Menampilkan JSON, kode teknis, atau simbol programming
+- Mengarang angka yang tidak ada di data`;
 
         const finalAnswer = await callNemotron(promptToSummary, true);
         updateSession(phone, message, finalAnswer);
