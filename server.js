@@ -223,7 +223,7 @@ async function callAI(promptText, enableThinking = false) {
             tanggal: r.tanggal
         }))
     };
-
+}
 
 // ==========================================
 // API ENDPOINT — MAIN CHAT
