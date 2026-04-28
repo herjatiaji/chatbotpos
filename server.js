@@ -3,21 +3,12 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import 'dotenv/config';
 import sql from './db.js';
-import OpenAI from 'openai';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
 
 app.use(express.json());
 app.use(express.static('public'));
-
-// ==========================================
-// KONFIGURASI NVIDIA NIM
-// ==========================================
-const openai = new OpenAI({
-    apiKey: process.env.NVIDIA_API_KEY,
-    baseURL: 'https://integrate.api.nvidia.com/v1',
-});
 
 // ==========================================
 // MULTI-TENANT: Rate limiter per store
@@ -43,10 +34,10 @@ const SESSION_TTL = 30 * 60 * 1000;
 
 function getSession(phone) {
     const session = sessionStore.get(phone);
-    if (!session) return { history: [], lastActive: Date.now() };
+    if (!session) return { history: [], lastActive: Date.now(), pendingNota: null };
     if (Date.now() - session.lastActive > SESSION_TTL) {
         sessionStore.delete(phone);
-        return { history: [], lastActive: Date.now() };
+        return { history: [], lastActive: Date.now(), pendingNota: null };
     }
     return session;
 }
@@ -85,214 +76,127 @@ function validateSQL(sqlQuery, storeId) {
     if (!/^\s*(?:WITH\s+\w|SELECT\s)/i.test(sqlQuery)) {
         throw new Error('SQL tidak aman: hanya SELECT atau CTE yang diizinkan.');
     }
+    const isFallback = sqlQuery.includes('PERTANYAAN_TIDAK_VALID') || sqlQuery.includes('PARSING_NOTA');
     const storeIdPattern = new RegExp(`store_id\\s*=\\s*${storeId}(?!\\d)`);
-    if (!storeIdPattern.test(sqlQuery)) {
+    if (!storeIdPattern.test(sqlQuery) && !isFallback) {
         throw new Error(`SQL tidak aman: tidak ada filter store_id = ${storeId}.`);
     }
 }
 
 // ==========================================
-// AI ENGINE
 // ==========================================
-async function callNemotron(promptText, enableThinking = false, retries = 3, delay = 5000) {
+// DUAL-MODEL ENGINE
+// ─────────────────────────────────────────
+// callSQL()  → Llama 4 Maverick
+//              lebih cepat di NIM endpoint
+//              khusus SQL generation
+//
+// callChat() → DeepSeek R1
+//              reasoning kuat, thinking mode
+//              untuk summary, HPP, nota
+// ==========================================
+
+const NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1/chat/completions";
+
+// Core streaming fetch — dipakai oleh callSQL dan callChat
+async function callNIM(model, promptText, temperature = 0.1, retries = 3, delay = 5000) {
     if (!process.env.NVIDIA_API_KEY) throw new Error('NVIDIA_API_KEY kosong!');
+
+    const headers = {
+        "Authorization": `Bearer ${process.env.NVIDIA_API_KEY}`,
+        "Accept": "text/event-stream",
+        "Content-Type": "application/json"
+    };
+
+    const payload = {
+        model,
+        "messages": [{ "role": "user", "content": promptText }],
+        "max_tokens": 4096,
+        temperature,
+        "top_p": 0.95,
+        "stream": true
+    };
 
     for (let i = 0; i < retries; i++) {
         try {
-            const stream = await openai.chat.completions.create({
-                model: 'nvidia/nemotron-3-super-120b-a12b',
-                messages: [{ role: 'user', content: promptText }],
-                temperature: enableThinking ? 1 : 0.1,
-                top_p: 0.95,
-                max_tokens: enableThinking ? 4096 : 2048,
-                reasoning_budget: enableThinking ? 4096 : 0,
-                chat_template_kwargs: { enable_thinking: enableThinking },
-                stream: true,
+            const response = await fetch(NVIDIA_BASE_URL, {
+                method: 'POST',
+                headers,
+                body: JSON.stringify(payload)
             });
 
+            if (!response.ok) {
+                const isOverload = response.status === 503 || response.status === 429;
+                if (i === retries - 1 || !isOverload) throw new Error(`HTTP ${response.status}`);
+                console.log(`   [⚠️ ${model}] Server sibuk, retry dalam ${delay/1000}s...`);
+                await new Promise(res => setTimeout(res, delay));
+                delay *= 2;
+                continue;
+            }
+
+            const reader = response.body.getReader();
+            const decoder = new TextDecoder('utf-8');
             let fullContent = '';
-            let reasoningBuffer = '';
-            for await (const chunk of stream) {
-                const delta = chunk.choices[0]?.delta;
-                // Skip reasoning_content — hanya ambil content final
-                if (delta?.reasoning_content) {
-                    reasoningBuffer += delta.reasoning_content;
-                }
-                if (delta?.content) {
-                    fullContent += delta.content;
+            let buffer = '';
+
+            while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                buffer += decoder.decode(value, { stream: true });
+                const lines = buffer.split('\n');
+                buffer = lines.pop();
+                for (const line of lines) {
+                    if (!line.startsWith('data: ')) continue;
+                    const dataStr = line.substring(6).trim();
+                    if (dataStr === '[DONE]') continue;
+                    try {
+                        const parsed = JSON.parse(dataStr);
+                        const content = parsed.choices?.[0]?.delta?.content;
+                        if (content) fullContent += content;
+                    } catch (e) {}
                 }
             }
-            // Bersihkan sisa thinking yang bocor ke content (pola bahasa Inggris di awal)
-            let cleaned = fullContent.trim();
-            // Hapus blok <think>...</think> jika ada
-            cleaned = cleaned.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
-            // Hapus baris-baris awal yang seluruhnya bahasa Inggris (reasoning bocor)
-            const lines = cleaned.split('\n');
-            const firstIdLines = lines.findIndex(l => /[a-zA-Z]{4,}/.test(l) === false || /[\u00C0-\u024F\u1E00-\u1EFF]/.test(l) || /^[^a-zA-Z]*$/.test(l));
-            return cleaned;
+
+            return fullContent.trim();
 
         } catch (error) {
-            console.log(`   [⚠️ API Error] Percobaan ${i + 1}/${retries}: ${error.message}`);
-            const isOverload = error.status === 503 || error.status === 429 ||
-                               error.message?.includes('503') || error.message?.includes('429');
-            if (i === retries - 1 || !isOverload) throw new Error('Gagal menghubungi server AI.');
+            console.log(`   [⚠️ API Error] Percobaan ${i+1}/${retries}: ${error.message}`);
+            if (i === retries - 1) throw new Error('Gagal menghubungi server AI.');
             await new Promise(res => setTimeout(res, delay));
             delay *= 2;
         }
     }
 }
 
-// ==========================================
-// HELPER: Ambil rentang data transaksi
-// ==========================================
-async function getDataRange(storeId) {
-    try {
-        const result = await sql`
-            SELECT 
-                MIN(transaction_date)::date AS tanggal_pertama,
-                MAX(transaction_date)::date AS tanggal_terakhir,
-                COUNT(*) AS total_transaksi
-            FROM transactions WHERE store_id = ${storeId}
-        `;
-        return result[0];
-    } catch { return null; }
+// ── Model A: Llama 4 Maverick — SQL Generation ──
+// Lebih cepat di NIM shared endpoint, deterministik
+async function callSQL(promptText) {
+    console.log('   [⚡ Llama 4 Maverick] Generating SQL...');
+    return callNIM(
+        'meta/llama-4-maverick-17b-128e-instruct',
+        promptText,
+        0.1   // temperature rendah = deterministik
+    );
 }
 
-// ==========================================
-// HELPER: Deteksi chitchat
-// ==========================================
-function isChitchat(message) {
-    const patterns = [
-        /^halo/i, /^hai/i, /^hi\b/i, /^hey/i,
-        /^apa kabar/i, /^selamat/i, /^terima kasih/i, /^makasih/i,
-        /^siapa kamu/i, /^kamu itu/i, /^bisa apa/i, /^help\b/i, /^bantuan/i,
-    ];
-    return patterns.some(p => p.test(message.trim()));
+// ── Model B: DeepSeek R1 — Summary, HPP, Nota ──
+// Reasoning model, thinking mode aktif, jawaban lebih cerdas
+async function callChat(promptText) {
+    console.log('   [🤔 DeepSeek R1] Thinking...');
+    return callNIM(
+        'deepseek-ai/deepseek-r1',
+        promptText,
+        0.6   // temperature lebih bebas = lebih natural
+    );
 }
 
-// ==========================================
-// HELPER: Deteksi apakah pesan adalah nota/struk
-// Format yang didukung:
-// - "nota: item1 x qty harga, item2 x qty harga"
-// - Teks bebas berisi daftar item & harga
-// ==========================================
-function isNota(message) {
-    const notaPatterns = [
-        /nota[:\s]/i,
-        /struk[:\s]/i,
-        /receipt[:\s]/i,
-        /baca\s+nota/i,
-        /input\s+nota/i,
-        /catat\s+nota/i,
-        // Deteksi pola item x qty = harga
-        /\d+\s*[xX]\s*\d+/,
-        /rp\.?\s*\d{3,}/i,
-    ];
-    return notaPatterns.some(p => p.test(message.trim()));
+// Backward-compat alias (untuk parseNota yang masih pakai callAI)
+async function callAI(promptText, enableThinking = false) {
+    if (enableThinking) return callChat(promptText);
+    return callSQL(promptText);
 }
 
-// ==========================================
-// PARSER NOTA: Ekstrak item dari teks nota
-// ==========================================
-async function parseNota(notaText, storeId) {
-    const prompt = `
-Kamu adalah parser nota/struk belanja yang akurat.
-Tugasmu: ekstrak semua item dari teks nota berikut dan kembalikan HANYA JSON array.
 
-Format JSON yang WAJIB dikembalikan (tanpa markdown, tanpa penjelasan):
-[
-  {
-    "nama_item": "nama barang",
-    "qty": angka,
-    "harga_satuan": angka,
-    "subtotal": angka,
-    "kategori_perkiraan": "bahan_baku | menu | operasional | lainnya"
-  }
-]
-
-Aturan:
-- Jika qty tidak disebutkan, asumsikan 1
-- Jika harga satuan tidak ada tapi subtotal ada, hitung: harga_satuan = subtotal / qty
-- Jika subtotal tidak ada, hitung: subtotal = qty * harga_satuan
-- Buang karakter mata uang (Rp, IDR) dari angka
-- kategori_perkiraan: tebak berdasarkan nama item (kopi/gula/susu = bahan_baku, dll)
-- Kembalikan array kosong [] jika tidak ada item yang bisa diekstrak
-
-Teks nota:
-${notaText}
-
-JSON:`;
-
-    const result = await callNemotron(prompt, false);
-    try {
-        const cleaned = result.replace(/```json/ig, '').replace(/```/g, '').trim();
-        return JSON.parse(cleaned);
-    } catch {
-        return [];
-    }
-}
-
-// ==========================================
-// HELPER: Deteksi apakah pertanyaan tentang HPP
-// ==========================================
-function isHPPQuestion(message) {
-    const hppPatterns = [
-        /\bhpp\b/i,
-        /harga\s+pokok/i,
-        /cost\s+of\s+goods/i,
-        /biaya\s+produksi/i,
-        /margin\s+(kotor|bersih|keuntungan)/i,
-        /keuntungan\s+(kotor|bersih|per\s+menu)/i,
-        /berapa\s+(untung|profit|margin)/i,
-        /profit\s+margin/i,
-        /mark.?up/i,
-    ];
-    return hppPatterns.some(p => p.test(message.trim()));
-}
-
-// ==========================================
-// HPP CALCULATOR: Ambil semua data relevan dari DB
-// Serahkan ke AI untuk reasoning — jangan filter di SQL
-// karena deskripsi cash_logs sering generik
-// ==========================================
-async function hitungHPP(storeId, menuKeyword = null) {
-    const menuFilter = menuKeyword
-        ? `AND mi.name ILIKE '%${menuKeyword}%'`
-        : '';
-
-    // Query 1: Data resep lengkap per menu
-    const resepData = await sql.unsafe(`
-        SELECT
-            mi.name     AS nama_menu,
-            mi.price    AS harga_jual,
-            inv.item_name AS nama_bahan,
-            inv.unit,
-            inv.current_stock,
-            mr.qty_used
-        FROM menu_items mi
-        JOIN menu_recipes mr ON mr.menu_item_id = mi.id
-        JOIN inventory inv   ON inv.id = mr.inventory_id
-        WHERE mi.store_id = ${storeId}
-        ${menuFilter}
-        ORDER BY mi.name, inv.item_name
-    `);
-
-    // Query 2: SEMUA pengeluaran kas (type=out) — tanpa filter nama bahan
-    // Biarkan AI yang reasoning mana yang relevan
-    const allCashOut = await sql.unsafe(`
-        SELECT
-            cl.amount       AS total_bayar,
-            cl.description  AS keterangan,
-            cl.created_at::date AS tanggal
-        FROM cash_logs cl
-        WHERE cl.store_id = ${storeId}
-        AND cl.type = 'out'
-        ORDER BY cl.created_at DESC
-        LIMIT 50
-    `);
-
-    // Susun per menu
-    const menuMap = {};
     for (const row of resepData) {
         if (!menuMap[row.nama_menu]) {
             menuMap[row.nama_menu] = {
@@ -319,7 +223,7 @@ async function hitungHPP(storeId, menuKeyword = null) {
             tanggal: r.tanggal
         }))
     };
-}
+
 
 // ==========================================
 // API ENDPOINT — MAIN CHAT
@@ -388,6 +292,40 @@ app.post('/api/chat', async (req, res) => {
             .join('\n');
 
         // ══════════════════════════════════════════════════════
+        // ✅ FLOW: KONFIRMASI SIMPAN NOTA
+        // ══════════════════════════════════════════════════════
+        if (message.toLowerCase() === 'simpan' && session.pendingNota) {
+            console.log("   [📥 Menyimpan nota ke Database...]");
+            const { total, description } = session.pendingNota;
+
+            await sql`
+                INSERT INTO cash_logs (store_id, type, amount, description, created_at)
+                VALUES (${storeId}, 'out', ${total}, ${description}, NOW())
+            `;
+
+            session.pendingNota = null;
+            sessionStore.set(phone, session);
+
+            return res.json({
+                success: true,
+                answer: `✅ Pengeluaran sebesar Rp ${total.toLocaleString('id-ID')} berhasil dicatat ke laporan keuangan ${storeName}.\n\nAda lagi yang bisa Kazeer bantu?`,
+                sql: null,
+                rawData: []
+            });
+        }
+
+        if (message.toLowerCase() === 'batal' && session.pendingNota) {
+            session.pendingNota = null;
+            sessionStore.set(phone, session);
+            return res.json({
+                success: true,
+                answer: "Pencatatan nota dibatalkan. 👌",
+                sql: null,
+                rawData: []
+            });
+        }
+
+        // ══════════════════════════════════════════════════════
         // 🧾 FLOW: PARSER NOTA
         // ══════════════════════════════════════════════════════
         if (isNota(message)) {
@@ -404,6 +342,15 @@ app.post('/api/chat', async (req, res) => {
             }
 
             const totalNota = items.reduce((sum, i) => sum + (i.subtotal || 0), 0);
+
+            // Simpan ke session agar bisa dikonfirmasi dengan SIMPAN
+            const itemDescription = items.map(i => `${i.nama_item} (${i.qty}x)`).join(', ');
+            session.pendingNota = {
+                items,
+                total: totalNota,
+                description: `Belanja: ${itemDescription}`
+            };
+            sessionStore.set(phone, session);
 
             // Kirim ke AI untuk analisis
             const notaPrompt = `
@@ -428,7 +375,7 @@ Format jawaban: gunakan paragraf pendek, emoji yang relevan, dan poin-poin singk
 Gunakan bahasa Indonesia yang profesional namun ramah — bukan formal kaku.
 JANGAN tampilkan JSON mentah.`;
 
-            const notaAnswer = await callNemotron(notaPrompt, true);
+            const notaAnswer = await callChat(notaPrompt); // DeepSeek R1
             updateSession(phone, message, notaAnswer);
 
             return res.json({
@@ -484,7 +431,7 @@ ATURAN FORMAT (WAJIB DIIKUTI):
 - Jika ada bahan tanpa referensi harga, sebutkan dengan jelas di output
 - Jangan tampilkan JSON mentah`;
 
-            const hppAnswer = await callNemotron(hppPrompt, true); // thinking ON
+            const hppAnswer = await callChat(hppPrompt); // DeepSeek R1 thinking
             updateSession(phone, message, hppAnswer);
 
             return res.json({
@@ -500,6 +447,22 @@ ATURAN FORMAT (WAJIB DIIKUTI):
         // 🧠 FLOW UTAMA: SQL → DB → ANSWER
         // ══════════════════════════════════════════════════════
         const today = new Date().toISOString().split('T')[0];
+
+        // ── Inject skema dinamis per cafe ──────────────────────
+        // Ambil kategori & sample menu dari DB cafe yang sedang dilayani
+        // agar SQL generator tahu nama kategori yang benar
+        let kategoriList = 'Kopi, Non-Kopi, Makanan Berat, Snack & Dessert'; // default fallback
+        let menuSample = '';
+        try {
+            const [kategoriDB, sampleMenuDB] = await Promise.all([
+                sql`SELECT name FROM menu_categories WHERE store_id = ${storeId} LIMIT 10`,
+                sql`SELECT name FROM menu_items WHERE store_id = ${storeId} LIMIT 8`
+            ]);
+            if (kategoriDB.length > 0) kategoriList = kategoriDB.map(k => k.name).join(', ');
+            if (sampleMenuDB.length > 0) menuSample = sampleMenuDB.map(m => m.name).join(', ');
+        } catch (e) {
+            console.log('   [⚠️ Schema fetch skip]', e.message);
+        }
 
         const SYSTEM_PROMPT = `
 Kamu adalah AI SQL Generator khusus untuk sistem cafe berbasis PostgreSQL.
@@ -553,9 +516,13 @@ Nama kategori di database BUKAN "minuman" atau "makanan" — gunakan pemetaan in
 | "snack", "cemilan", "dessert"                | mc.name ILIKE '%snack%'                                           |
 | (tidak ada filter kategori)                  | JANGAN JOIN ke menu_categories — query semua menu langsung        |
 
+KATEGORI MENU AKTUAL DI DATABASE CAFE INI:
+${kategoriList}
+${menuSample ? `CONTOH NAMA MENU: ${menuSample}` : ''}
+
 ATURAN KATEGORI KRITIS:
-- DILARANG filter mc.name ILIKE '%minuman%' — tidak ada kategori bernama "minuman" di DB.
-- DILARANG filter mc.name ILIKE '%makanan%' — gunakan '%makan%' atau '%snack%'.
+- GUNAKAN nama kategori persis seperti di atas saat filter mc.name ILIKE.
+- DILARANG hardcode nama kategori yang tidak ada di daftar atas.
 - Jika user tanya "semua menu terlaris" tanpa sebut kategori → JANGAN JOIN menu_categories.
 
 PEMETAAN KATA KEUANGAN (ROUTING KE QUERY YANG TEPAT):
@@ -683,7 +650,7 @@ FORMAT OUTPUT
 
         console.log("   [⏳ Step A: Generating SQL...]");
         const promptToSQL = `${SYSTEM_PROMPT}\n\nPertanyaan: "${message}"\nQuery SQL:`;
-        let sqlQuery = await callNemotron(promptToSQL, false);
+        let sqlQuery = await callSQL(promptToSQL);
         sqlQuery = sqlQuery.replace(/```sql/ig, '').replace(/```/g, '').trim();
 
         validateSQL(sqlQuery, storeId);
@@ -748,7 +715,7 @@ DILARANG KERAS:
 - Menampilkan JSON, kode teknis, atau simbol programming
 - Mengarang angka yang tidak ada di data`;
 
-        const finalAnswer = await callNemotron(promptToSummary, true);
+        const finalAnswer = await callChat(promptToSummary);
         updateSession(phone, message, finalAnswer);
 
         console.log("   [✅ Done]");
@@ -793,7 +760,7 @@ app.get('/health', (req, res) => {
     res.json({
         status: 'ok',
         app: 'Kazeer AI',
-        version: '2.0.0',
+        version: '3.0.0',
         activeSessions: sessionStore.size,
         timestamp: new Date().toISOString()
     });
@@ -803,12 +770,14 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, '0.0.0.0', () => {
     console.log(`
 ╔════════════════════════════════════════╗
-║        🤖 KAZEER AI v2.0.0            ║
+║        🤖 KAZEER AI v3.0.0            ║
 ║        Business Consultant Bot        ║
 ╠════════════════════════════════════════╣
 ║  🔗 Port    : ${PORT}                    ║
 ║  👥 Mode    : Multi-Tenant            ║
-║  🧠 Engine  : NVIDIA Nemotron         ║
+║  ⚡ SQL     : Llama 4 Maverick        ║
+║  💬 Chat    : DeepSeek R1            ║
+║  🤔 Chat    : DeepSeek R1            ║
 ║  📦 Features: SQL · Nota · HPP       ║
 ╚════════════════════════════════════════╝
     `);
