@@ -96,7 +96,6 @@ function validateSQL(sqlQuery, storeId) {
 // ==========================================
 
 const NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1/chat/completions";
-
 async function callNIM(model, promptText, temperature = 0.1, retries = 3, delay = 5000) {
     if (!process.env.NVIDIA_API_KEY) throw new Error('NVIDIA_API_KEY kosong!');
 
@@ -155,7 +154,10 @@ async function callNIM(model, promptText, temperature = 0.1, retries = 3, delay 
                 }
             }
 
-            return fullContent.trim();
+            let cleaned = fullContent.trim();
+            // Jaga-jaga kalau model sewaktu-waktu bocor thinking tag
+            cleaned = cleaned.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
+            return cleaned;
 
         } catch (error) {
             console.log(`   [⚠️ API Error] Percobaan ${i+1}/${retries}: ${error.message}`);
@@ -166,16 +168,18 @@ async function callNIM(model, promptText, temperature = 0.1, retries = 3, delay 
     }
 }
 
-// Model A: SQL generation — cepat & deterministik
+// ── Model A: SQL Generation (Kaku) ──
 async function callSQL(promptText) {
     console.log('   [⚡ Llama 4 Maverick] Generating SQL...');
+    // Gunakan Maverick dengan suhu rendah (0.1) agar deterministik & akurat untuk kodingan SQL
     return callNIM('meta/llama-4-maverick-17b-128e-instruct', promptText, 0.1);
 }
 
-// Model B: Summary, HPP, Nota — reasoning kuat
+// ── Model B: Chat, Summary, Nota, HPP (Luwes) ──
 async function callChat(promptText) {
-    console.log('   [🤔 DeepSeek R1] Thinking...');
-    return callNIM('deepseek-ai/deepseek-r1', promptText, 0.6);
+    console.log('   [🗣️ Llama 4 Maverick] Chat/Reasoning...');
+    // Tetap gunakan Maverick, tetapi dengan suhu lebih tinggi (0.6) agar lebih natural dan cerewet saat nge-chat
+    return callNIM('meta/llama-4-maverick-17b-128e-instruct', promptText, 0.6);
 }
 
 // ==========================================
@@ -216,10 +220,6 @@ function isNota(message) {
     const notaPatterns = [/\d+\s*[xX]\s*\d+/, /rp\.?\s*\d{3,}/i];
     return notaPatterns.some(p => p.test(msg));
 }
-
-// ==========================================
-// PARSER NOTA
-// ==========================================
 async function parseNota(notaText) {
     const prompt = `
 Kamu adalah parser nota/struk belanja yang akurat.
