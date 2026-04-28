@@ -347,12 +347,12 @@ app.post('/api/chat', async (req, res) => {
             activeUser = { owner_name: 'Demo Owner', store_id: 1, store_name: 'Bengkel Kopi' };
             console.log(`   [🎮 Demo] ${phone} → Store 1 (${activeUser.store_name})`);
         } else {
-            const userCheck = await sql\`
+            const userCheck = await sql`
                 SELECT u.owner_name, u.store_id, s.store_name 
                 FROM whatsapp_users u 
                 JOIN stores s ON u.store_id = s.id 
-                WHERE u.phone_number = \${phone}
-            \`;
+                WHERE u.phone_number = ${phone}
+            `;
 
             if (userCheck.length === 0) {
                 return res.status(403).json({ success: false, answer: "Mohon maaf, nomor Anda tidak terdaftar dalam sistem Kazeer AI." });
