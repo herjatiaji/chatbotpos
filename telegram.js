@@ -13,7 +13,7 @@ const bot = new TelegramBot(token, { polling: true });
 
 // 🔥 PERBAIKAN URL: Gunakan localhost atau 0.0.0.0 yang lebih ramah dengan Railway
 const port = process.env.PORT || 3000;
-const SERVER_URL = `http://localhost:${port}`; 
+const SERVER_URL = `https://chatbotpos-production.up.railway.app`;
 
 console.log(`
 🤖 Telegram Bot Klien: AKTIF!
