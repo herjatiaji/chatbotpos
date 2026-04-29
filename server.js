@@ -266,13 +266,44 @@ function isHPPQuestion(message) {
         /harga\s+pokok/i,
         /cost\s+of\s+goods/i,
         /biaya\s+produksi/i,
-        /margin\s+(kotor|bersih|keuntungan)/i,
-        /keuntungan\s+(kotor|bersih|per\s+menu)/i,
+        /margin/i,
+        /keuntungan/i,
+        /menguntungkan/i,
+        /paling\s+laba/i,
+        /paling\s+untung/i,
+        /menu\s+terbaik/i,
+        /menu\s+terburuk/i,
+        /menu\s+rugi/i,
+        /menu.*?mana.*?(untung|laba|rugi|profit)/i,
+        /mana.*?menu.*?(untung|laba|rugi|profit)/i,
         /berapa\s+(untung|profit|margin)/i,
         /profit\s+margin/i,
         /mark.?up/i,
+        /biaya\s+bahan/i,
+        /modal\s+per\s+menu/i,
     ];
     return hppPatterns.some(p => p.test(message.trim()));
+}
+
+// ==========================================
+// HELPER: Deteksi pertanyaan business advice (non-SQL)
+// ==========================================
+function isBusinessAdvice(message) {
+    const patterns = [
+        /promo\s+apa/i,
+        /strategi\s+apa/i,
+        /saran\s+(bisnis|usaha)/i,
+        /rekomendasi\s+(bisnis|menu|promo)/i,
+        /bagaimana\s+cara/i,
+        /tips\s+(bisnis|jualan|cafe)/i,
+        /cara\s+meningkatkan/i,
+        /cara\s+mengurangi/i,
+        /ide\s+(promo|bisnis|menu)/i,
+        /apa\s+yang\s+harus/i,
+        /langkah\s+apa/i,
+        /gimana\s+cara/i,
+    ];
+    return patterns.some(p => p.test(message.trim()));
 }
 
 // ==========================================
@@ -487,18 +518,19 @@ Pertanyaan owner: "${message}"
 Data NYATA dari database — resep menu beserta referensi harga bahan dari cash_logs:
 ${JSON.stringify(hppData, null, 2)}
 
-CARA MENGHITUNG HPP:
-- Jika ada catatan pembelian di cash_logs yang relevan → gunakan sebagai referensi harga beli
-- Jika tidak ada → tulis: "harga [nama bahan] tidak ditemukan di catatan pembelian"
-- HPP per bahan = estimasi berdasarkan proporsi qty_used terhadap total pembelian
+CARA MENGHITUNG HPP (WAJIB DIIKUTI KETAT):
+- Cocokkan nama bahan di resep dengan deskripsi di "catatan_pembelian_kas"
+- Jika cocok → gunakan jumlah pembelian sebagai dasar harga satuan bahan
+- Jika TIDAK ADA catatan yang cocok → tulis: "Harga [nama bahan] tidak tercatat di database"
+- DILARANG mengarang harga, mengasumsikan harga pasar, atau menyebut bahan yang tidak ada di data resep
 
-TUGAS:
-1. 🧮 Hitung HPP per menu berdasarkan data yang tersedia
-2. 💰 Hitung margin kotor: ((harga_jual - HPP) / harga_jual) × 100%
+TUGAS (HANYA gunakan data yang tersedia di atas):
+1. 🧮 Rincian HPP per menu — sebutkan setiap bahan dan harga jika tersedia
+2. 💰 Margin kotor: ((harga_jual - total_HPP) / harga_jual) x 100%
 3. 📊 Kategorikan: Rendah <30%, Sedang 30-60%, Tinggi >60%
-4. 🏆 Sebutkan menu paling menguntungkan
-5. ⚠️ Flag menu margin rendah atau bahan harga tidak tercatat
-6. 💡 Berikan 2-3 rekomendasi bisnis actionable
+4. 🏆 Menu paling menguntungkan berdasarkan data
+5. ⚠️ Daftar bahan yang harganya TIDAK tercatat di database
+6. 💡 Jika banyak bahan tidak tercatat, sarankan owner catat nota belanja ke sistem dulu
 
 ATURAN FORMAT:
 - DILARANG tanda bintang (*) atau markdown bold
@@ -510,6 +542,50 @@ ATURAN FORMAT:
             const hppAnswer = await callChat(hppPrompt);
             updateSession(phone, message, hppAnswer);
             return res.json({ success: true, answer: hppAnswer, sql: null, rawData: hppData, hppCalculated: true });
+        }
+
+        // ══════════════════════════════════════════════════════
+        // 💡 FLOW: BUSINESS ADVICE (non-SQL questions)
+        // ══════════════════════════════════════════════════════
+        if (isBusinessAdvice(message)) {
+            console.log("   [💡 Business advice terdeteksi...]");
+
+            // Ambil snapshot data ringkas dari DB sebagai konteks
+            let snapshotData = {};
+            try {
+                const [topMenu, omzetBulanIni] = await Promise.all([
+                    sql.unsafe(`SELECT mi.name, COALESCE(SUM(td.qty),0) AS total FROM transaction_details td JOIN transactions t ON td.transaction_id = t.id JOIN menu_items mi ON td.menu_item_id = mi.id WHERE t.store_id = ${storeId} AND DATE_TRUNC('month', t.transaction_date) = DATE_TRUNC('month', CURRENT_DATE) GROUP BY mi.name ORDER BY total DESC LIMIT 5`),
+                    sql.unsafe(`SELECT COALESCE(SUM(total_amount),0) AS omzet, COUNT(*) AS transaksi FROM transactions WHERE store_id = ${storeId} AND DATE_TRUNC('month', transaction_date) = DATE_TRUNC('month', CURRENT_DATE)`)
+                ]);
+                snapshotData = { top_menu_bulan_ini: topMenu, omzet_bulan_ini: omzetBulanIni[0] };
+            } catch (e) {}
+
+            const advicePrompt = `
+WAJIB: Seluruh jawaban dalam Bahasa Indonesia. DILARANG menggunakan Bahasa Inggris.
+
+Kamu adalah Kazeer, bot AI Business Consultant untuk ${storeName}.
+Owner bertanya: "${message}"
+
+Data bisnis saat ini (gunakan sebagai konteks):
+${JSON.stringify(snapshotData, null, 2)}
+
+Riwayat percakapan:
+${conversationHistory || '(Tidak ada riwayat)'}
+
+Tugas kamu:
+Berikan saran bisnis yang spesifik, actionable, dan relevan dengan kondisi ${storeName} berdasarkan data di atas.
+
+ATURAN FORMAT:
+- Maksimal 3-4 poin saran
+- Setiap poin diawali emoji
+- Pisahkan setiap poin dengan baris kosong
+- Gunakan angka (1. 2. 3.) bukan bullet
+- DILARANG tanda bintang (*) atau markdown bold
+- Bahasa profesional tapi ramah`;
+
+            const adviceAnswer = await callChat(advicePrompt);
+            updateSession(phone, message, adviceAnswer);
+            return res.json({ success: true, answer: adviceAnswer, sql: null, rawData: [] });
         }
 
         // ══════════════════════════════════════════════════════
@@ -657,6 +733,9 @@ SQL: SELECT COALESCE(SUM(t.total_amount),0) AS total_pendapatan, COUNT(t.id) AS 
 
 Pertanyaan: "5 menu terlaris bulan ini"
 SQL: SELECT mi.name AS nama_menu, COALESCE(SUM(td.qty),0) AS total_porsi, COALESCE(SUM(td.subtotal),0) AS total_pendapatan FROM transaction_details td JOIN transactions t ON td.transaction_id = t.id JOIN menu_items mi ON td.menu_item_id = mi.id WHERE t.store_id = ${storeId} AND DATE_TRUNC('month', t.transaction_date) = DATE_TRUNC('month', CURRENT_DATE) GROUP BY mi.name ORDER BY total_porsi DESC LIMIT 5;
+
+Pertanyaan: "menu paling menguntungkan" / "menu dengan margin tertinggi"
+SQL: SELECT mi.name AS nama_menu, mi.price AS harga_jual, COALESCE(SUM(td.qty),0) AS total_terjual, COALESCE(SUM(td.subtotal),0) AS total_omzet FROM transaction_details td JOIN transactions t ON td.transaction_id = t.id JOIN menu_items mi ON td.menu_item_id = mi.id WHERE t.store_id = ${storeId} AND DATE_TRUNC('month', t.transaction_date) = DATE_TRUNC('month', CURRENT_DATE) GROUP BY mi.name, mi.price ORDER BY total_omzet DESC LIMIT 10;
 
 Pertanyaan: "minuman terlaris bulan ini"
 SQL: SELECT mi.name AS nama_menu, COALESCE(SUM(td.qty),0) AS total_porsi, COALESCE(SUM(td.subtotal),0) AS total_pendapatan FROM transaction_details td JOIN transactions t ON td.transaction_id = t.id JOIN menu_items mi ON td.menu_item_id = mi.id JOIN menu_categories mc ON mi.category_id = mc.id WHERE t.store_id = ${storeId} AND (mc.name ILIKE '%kopi%' OR mc.name ILIKE '%non%') AND DATE_TRUNC('month', t.transaction_date) = DATE_TRUNC('month', CURRENT_DATE) GROUP BY mi.name ORDER BY total_porsi DESC LIMIT 5;
