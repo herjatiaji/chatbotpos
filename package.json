@@ -17,6 +17,7 @@
     "express": "^5.2.1",
     "node-telegram-bot-api": "^0.67.0",
     "openai": "^6.34.0",
-    "postgres": "^3.4.9"
+    "postgres": "^3.4.9",
+    "twilio": "^6.0.0"
   }
 }

@@ -8,6 +8,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
 
 app.use(express.json());
+app.use(express.urlencoded({ extended: true })); // Wajib untuk Twilio webhook
 app.use(express.static('public'));
 
 // ==========================================
@@ -889,18 +890,93 @@ app.post('/api/catat-nota', async (req, res) => {
     }
 });
 
+
+// ==========================================
+// 📱 TWILIO WHATSAPP WEBHOOK
+// ==========================================
+// Setup di Twilio Console:
+// Sandbox → "When a message comes in" → https://your-domain.com/webhook/twilio
+// Method: HTTP POST
+// ==========================================
+
+// Helper: Format jawaban untuk WhatsApp (plain text, no markdown)
+function formatForWhatsApp(text) {
+    return text
+        .replace(/\*\*(.*?)\*\*/g, '$1')   // hapus bold **...**
+        .replace(/\*(.*?)\*/g, '$1')         // hapus italic *...*
+        .replace(/`{1,3}[^`]*`{1,3}/g, '')    // hapus code blocks
+        .replace(/#{1,6}\s/g, '')             // hapus heading #
+        .trim();
+}
+
+// Helper: Kirim balik TwiML response ke Twilio
+function twimlReply(res, message) {
+    const safe = message
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;');
+
+    res.set('Content-Type', 'text/xml');
+    res.send(`<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Message>${safe}</Message>
+</Response>`);
+}
+
+app.post('/webhook/twilio', async (req, res) => {
+    const from    = req.body.From || '';   // "whatsapp:+6281234567890"
+    const body    = (req.body.Body || '').trim();
+    const numFrom = from.replace('whatsapp:', ''); // "+6281234567890"
+    const phone   = numFrom.replace('+', '');      // "6281234567890"
+
+    console.log(`\n📱 [Twilio] ${numFrom}: "${body}"`);
+
+    if (!body) {
+        return twimlReply(res, 'Halo! Silakan kirim pertanyaan bisnis kamu. 🚀');
+    }
+
+    try {
+        // Panggil endpoint /api/chat yang sudah ada
+        const protocol = req.headers['x-forwarded-proto'] || 'http';
+        const host = req.headers.host;
+        const baseUrl = `${protocol}://${host}`;
+
+        const response = await fetch(`${baseUrl}/api/chat`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ message: body, phone })
+        });
+
+        const data = await response.json();
+        const answer = formatForWhatsApp(data.answer || 'Maaf, tidak ada respons dari server.');
+
+        // Twilio max 1600 karakter per pesan — potong jika lebih
+        const MAX_LEN = 1550;
+        if (answer.length > MAX_LEN) {
+            const part1 = answer.substring(0, MAX_LEN) + '...';
+            return twimlReply(res, part1);
+        }
+
+        return twimlReply(res, answer);
+
+    } catch (error) {
+        console.error('❌ Twilio webhook error:', error.message);
+        return twimlReply(res, '⚠️ Maaf, terjadi kendala teknis. Silakan coba beberapa saat lagi.');
+    }
+});
+
 // ==========================================
 // HEALTH CHECK
 // ==========================================
 app.get('/health', (req, res) => {
-    res.json({ status: 'ok', app: 'Kazeer AI', version: '3.0.0', activeSessions: sessionStore.size, timestamp: new Date().toISOString() });
+    res.json({ status: 'ok', app: 'Kazeer AI', version: '3.1.0', activeSessions: sessionStore.size, timestamp: new Date().toISOString() });
 });
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, '0.0.0.0', () => {
     console.log(`
 ╔════════════════════════════════════════╗
-║        🤖 KAZEER AI v3.0.0            ║
+║        🤖 KAZEER AI v3.1.0            ║
 ║        Business Consultant Bot        ║
 ╠════════════════════════════════════════╣
 ║  🔗 Port    : ${PORT}                    ║
@@ -908,6 +984,7 @@ app.listen(PORT, '0.0.0.0', () => {
 ║  ⚡ SQL     : Llama 4 Maverick        ║
 ║  🤔 Chat    : DeepSeek R1             ║
 ║  📦 Features: SQL · Nota · HPP        ║
+║  📱 Webhook : /webhook/twilio          ║
 ╚════════════════════════════════════════╝
     `);
 });
