@@ -900,43 +900,61 @@ app.post('/api/catat-nota', async (req, res) => {
 // ==========================================
 
 // Helper: Format jawaban untuk WhatsApp (plain text, no markdown)
+// ==========================================
+// 📱 TWILIO WHATSAPP WEBHOOK (DENGAN AUTO-SPLIT)
+// ==========================================
 function formatForWhatsApp(text) {
-    return text
-        .replace(/\*\*(.*?)\*\*/g, '$1')   // hapus bold **...**
-        .replace(/\*(.*?)\*/g, '$1')         // hapus italic *...*
-        .replace(/`{1,3}[^`]*`{1,3}/g, '')    // hapus code blocks
-        .replace(/#{1,6}\s/g, '')             // hapus heading #
-        .trim();
+    return text.replace(/\*\*(.*?)\*\*/g, '$1').replace(/\*(.*?)\*/g, '$1').replace(/`{1,3}[^`]*`{1,3}/g, '').replace(/#{1,6}\s/g, '').trim();
 }
 
-// Helper: Kirim balik TwiML response ke Twilio
-function twimlReply(res, message) {
-    const safe = message
-        .replace(/&/g, '&amp;')
-        .replace(/</g, '&lt;')
-        .replace(/>/g, '&gt;');
+// Fitur baru: Memecah pesan panjang menjadi beberapa bubble chat
+function twimlReplyChunks(res, message) {
+    const MAX_LEN = 1500; // Batas aman WhatsApp
+    const chunks = [];
+    let str = message;
 
+    while (str.length > 0) {
+        if (str.length <= MAX_LEN) {
+            chunks.push(str);
+            break;
+        }
+        
+        // Cari titik pemotongan yang rapi (enter terakhir sebelum batas 1500 karakter)
+        let breakPoint = str.lastIndexOf('\n', MAX_LEN);
+        if (breakPoint === -1) breakPoint = str.lastIndexOf('. ', MAX_LEN) + 1; 
+        if (breakPoint === -1 || breakPoint === 0) breakPoint = MAX_LEN; // Jika terpaksa, potong paksa
+        
+        chunks.push(str.substring(0, breakPoint));
+        str = str.substring(breakPoint).trim();
+    }
+
+    // Susun XML Response untuk Twilio (Mengirim multiple <Message>)
     res.set('Content-Type', 'text/xml');
-    res.send(`<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-    <Message>${safe}</Message>
-</Response>`);
+    let xml = `<?xml version="1.0" encoding="UTF-8"?>\n<Response>\n`;
+    for (const chunk of chunks) {
+        const safeChunk = chunk.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+        xml += `    <Message>${safeChunk}</Message>\n`;
+    }
+    xml += `</Response>`;
+    res.send(xml);
 }
 
 app.post('/webhook/twilio', async (req, res) => {
-    const from    = req.body.From || '';   // "whatsapp:+6281234567890"
-    const body    = (req.body.Body || '').trim();
-    const numFrom = from.replace('whatsapp:', ''); // "+6281234567890"
-    const phone   = numFrom.replace('+', '');      // "6281234567890"
+    const from = req.body.From || '';   
+    const body = (req.body.Body || '').trim();
+    const phone = from.replace('whatsapp:', '').replace('+', ''); 
 
-    console.log(`\n📱 [Twilio] ${numFrom}: "${body}"`);
-
-    if (!body) {
-        return twimlReply(res, 'Halo! Silakan kirim pertanyaan bisnis kamu. 🚀');
+    const numMedia = parseInt(req.body.NumMedia || '0');
+    let imageUrl = null;
+    if (numMedia > 0 && req.body.MediaContentType0?.startsWith('image/')) {
+        imageUrl = req.body.MediaUrl0;
     }
 
+    console.log(`\n📱 [Twilio Webhook] Dari: ${phone} | Teks: "${body}" | Gambar: ${imageUrl || 'Tidak ada'}`);
+
+    if (!body && !imageUrl) return twimlReplyChunks(res, 'Halo! Silakan kirim pesan atau foto nota untuk dicatat.');
+
     try {
-        // Panggil endpoint /api/chat yang sudah ada
         const protocol = req.headers['x-forwarded-proto'] || 'http';
         const host = req.headers.host;
         const baseUrl = `${protocol}://${host}`;
@@ -944,24 +962,18 @@ app.post('/webhook/twilio', async (req, res) => {
         const response = await fetch(`${baseUrl}/api/chat`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ message: body, phone })
+            body: JSON.stringify({ message: body, phone, imageUrl })
         });
 
         const data = await response.json();
-        const answer = formatForWhatsApp(data.answer || 'Maaf, tidak ada respons dari server.');
+        const answer = formatForWhatsApp(data.answer || 'Maaf, server gagal merespons.');
 
-        // Twilio max 1600 karakter per pesan — potong jika lebih
-        const MAX_LEN = 1550;
-        if (answer.length > MAX_LEN) {
-            const part1 = answer.substring(0, MAX_LEN) + '...';
-            return twimlReply(res, part1);
-        }
-
-        return twimlReply(res, answer);
+        // 🚀 Gunakan fungsi chunk yang baru
+        return twimlReplyChunks(res, answer);
 
     } catch (error) {
         console.error('❌ Twilio webhook error:', error.message);
-        return twimlReply(res, '⚠️ Maaf, terjadi kendala teknis. Silakan coba beberapa saat lagi.');
+        return twimlReplyChunks(res, '⚠️ Maaf, terjadi kendala teknis di Webhook.');
     }
 });
 
